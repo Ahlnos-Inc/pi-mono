@@ -86,6 +86,11 @@ interface BedrockProviderModule {
 	) => AsyncIterable<AssistantMessageEvent>;
 }
 
+interface ClaudeCliProviderModule {
+	streamClaudeCli: StreamFunction<"claude-cli", StreamOptions>;
+	streamSimpleClaudeCli: StreamFunction<"claude-cli", SimpleStreamOptions>;
+}
+
 const importNodeOnlyProvider = (specifier: string): Promise<unknown> => import(specifier);
 
 let anthropicProviderModulePromise:
@@ -117,6 +122,9 @@ let bedrockProviderModuleOverride:
 	| undefined;
 let bedrockProviderModulePromise:
 	| Promise<LazyProviderModule<"bedrock-converse-stream", BedrockOptions, SimpleStreamOptions>>
+	| undefined;
+let claudeCliProviderModulePromise:
+	| Promise<LazyProviderModule<"claude-cli", StreamOptions, SimpleStreamOptions>>
 	| undefined;
 
 export function setBedrockProviderModule(module: BedrockProviderModule): void {
@@ -320,6 +328,17 @@ function loadBedrockProviderModule(): Promise<
 	return bedrockProviderModulePromise;
 }
 
+function loadClaudeCliProviderModule(): Promise<LazyProviderModule<"claude-cli", StreamOptions, SimpleStreamOptions>> {
+	claudeCliProviderModulePromise ||= importNodeOnlyProvider("./claude-cli.js").then((module) => {
+		const provider = module as ClaudeCliProviderModule;
+		return {
+			stream: provider.streamClaudeCli,
+			streamSimple: provider.streamSimpleClaudeCli,
+		};
+	});
+	return claudeCliProviderModulePromise;
+}
+
 export const streamAnthropic = createLazyStream(loadAnthropicProviderModule);
 export const streamSimpleAnthropic = createLazySimpleStream(loadAnthropicProviderModule);
 export const streamAzureOpenAIResponses = createLazyStream(loadAzureOpenAIResponsesProviderModule);
@@ -338,6 +357,8 @@ export const streamOpenAIResponses = createLazyStream(loadOpenAIResponsesProvide
 export const streamSimpleOpenAIResponses = createLazySimpleStream(loadOpenAIResponsesProviderModule);
 const streamBedrockLazy = createLazyStream(loadBedrockProviderModule);
 const streamSimpleBedrockLazy = createLazySimpleStream(loadBedrockProviderModule);
+export const streamClaudeCli = createLazyStream(loadClaudeCliProviderModule);
+export const streamSimpleClaudeCli = createLazySimpleStream(loadClaudeCliProviderModule);
 
 export function registerBuiltInApiProviders(): void {
 	registerApiProvider({
@@ -392,6 +413,12 @@ export function registerBuiltInApiProviders(): void {
 		api: "bedrock-converse-stream",
 		stream: streamBedrockLazy,
 		streamSimple: streamSimpleBedrockLazy,
+	});
+
+	registerApiProvider({
+		api: "claude-cli",
+		stream: streamClaudeCli,
+		streamSimple: streamSimpleClaudeCli,
 	});
 }
 

@@ -179,6 +179,10 @@ export function getEnvApiKey(provider: string): string | undefined {
 		}
 	}
 
+	if (provider === "claude-cli") {
+		return "<native>";
+	}
+
 	if (provider === "amazon-bedrock") {
 		// Amazon Bedrock supports multiple credential sources:
 		// 1. AWS_PROFILE - named profile from ~/.aws/credentials
