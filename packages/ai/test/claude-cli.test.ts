@@ -103,7 +103,7 @@ describe("claude-cli provider", () => {
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
 	});
 
-	it("terminates a hung claude subprocess when timeoutMs elapses", () => {
+	it("terminates a silent claude subprocess when idle timeoutMs elapses", () => {
 		vi.useFakeTimers();
 		const child = new MockChildProcess();
 		spawnMock.mockReturnValue(child);
@@ -111,6 +111,24 @@ describe("claude-cli provider", () => {
 		streamClaudeCli(model, context(), { timeoutMs: 25 });
 
 		vi.advanceTimersByTime(25);
+
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+	});
+
+	it("extends the idle timeout when claude emits stream activity", () => {
+		vi.useFakeTimers();
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		streamClaudeCli(model, context(), { timeoutMs: 25 });
+
+		vi.advanceTimersByTime(20);
+		writeJsonl(child, [{ type: "system", subtype: "status", status: "requesting" }]);
+		vi.advanceTimersByTime(20);
+
+		expect(child.kill).not.toHaveBeenCalled();
+
+		vi.advanceTimersByTime(5);
 
 		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
 	});

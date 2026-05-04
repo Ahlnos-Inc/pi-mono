@@ -142,7 +142,11 @@ describe("AgentSession retry and event characterization", () => {
 	});
 
 	it("does not retry local claude-cli subprocess failures", async () => {
-		for (const errorMessage of ["claude-cli timed out after 600s", "claude -p exited with code 143"]) {
+		for (const errorMessage of [
+			"claude-cli idle timed out after 600s",
+			"claude-cli max runtime timed out after 3600s",
+			"claude -p exited with code 143",
+		]) {
 			const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 			harnesses.push(harness);
 			harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage })]);

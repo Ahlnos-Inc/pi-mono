@@ -2422,7 +2422,9 @@ export class AgentSession {
 		// Local claude-cli subprocess timeouts and user/process terminations are deterministic for
 		// the current turn. Retrying them just replays the same expensive local CLI work.
 		if (
-			/claude-cli timed out after \d+ms|claude-cli timed out after \d+s|claude -p exited with code 143/i.test(err)
+			/claude-cli (?:idle |max runtime )?timed out after \d+ms|claude-cli (?:idle |max runtime )?timed out after \d+s|claude -p exited with code 143/i.test(
+				err,
+			)
 		) {
 			return false;
 		}

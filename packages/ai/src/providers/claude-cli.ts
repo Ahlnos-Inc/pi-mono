@@ -41,13 +41,22 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * 10 covers a typical session worth of working context.
  */
 const MAX_PRIOR_TURNS = 10;
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const KILL_GRACE_MS = 5_000;
 
-function resolveTimeoutMs(timeoutMs?: number): number {
-	const envTimeout = Number.parseInt(process.env.PI_CLAUDE_CLI_TIMEOUT_MS ?? "", 10);
-	const resolved = timeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : DEFAULT_TIMEOUT_MS);
+function positiveEnvInt(name: string): number | undefined {
+	const value = Number.parseInt(process.env[name] ?? "", 10);
+	return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function resolveIdleTimeoutMs(timeoutMs?: number): number {
+	const envTimeout = positiveEnvInt("PI_CLAUDE_CLI_IDLE_TIMEOUT_MS") ?? positiveEnvInt("PI_CLAUDE_CLI_TIMEOUT_MS");
+	const resolved = timeoutMs ?? envTimeout ?? DEFAULT_IDLE_TIMEOUT_MS;
 	return Math.max(1, resolved);
+}
+
+function resolveMaxRuntimeMs(): number | undefined {
+	return positiveEnvInt("PI_CLAUDE_CLI_MAX_RUNTIME_MS");
 }
 
 function extractPrompt(context: Context): string {
@@ -254,7 +263,8 @@ function runClaudeCli(
 ) {
 	const stream = createAssistantMessageEventStream();
 	const prompt = extractPrompt(context);
-	const timeoutMs = resolveTimeoutMs(options?.timeoutMs);
+	const idleTimeoutMs = resolveIdleTimeoutMs(options?.timeoutMs);
+	const maxRuntimeMs = resolveMaxRuntimeMs();
 
 	const childEnv: NodeJS.ProcessEnv = { ...process.env };
 	delete childEnv.ANTHROPIC_API_KEY;
@@ -285,7 +295,10 @@ function runClaudeCli(
 	let responseModel: string | undefined;
 	let finalUsage: Usage | undefined;
 	let aborted = false;
-	let timedOut = false;
+	let idleTimedOut = false;
+	let maxRuntimeTimedOut = false;
+	let idleTimer: ReturnType<typeof setTimeout> | undefined;
+	let maxRuntimeTimer: ReturnType<typeof setTimeout> | undefined;
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
 	const blocks = new Map<number, ClaudeCliContentBlockState>();
 
@@ -298,8 +311,7 @@ function runClaudeCli(
 		}
 	};
 
-	const timeoutTimer = setTimeout(() => {
-		timedOut = true;
+	const terminate = () => {
 		try {
 			child.kill("SIGTERM");
 		} catch {
@@ -312,10 +324,27 @@ function runClaudeCli(
 				/* noop */
 			}
 		}, KILL_GRACE_MS);
-	}, timeoutMs);
+	};
+
+	const resetIdleTimer = () => {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = setTimeout(() => {
+			idleTimedOut = true;
+			terminate();
+		}, idleTimeoutMs);
+	};
+
+	resetIdleTimer();
+	if (maxRuntimeMs !== undefined) {
+		maxRuntimeTimer = setTimeout(() => {
+			maxRuntimeTimedOut = true;
+			terminate();
+		}, maxRuntimeMs);
+	}
 
 	const cleanup = () => {
-		clearTimeout(timeoutTimer);
+		if (idleTimer) clearTimeout(idleTimer);
+		if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
 		if (killTimer) clearTimeout(killTimer);
 		if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 	};
@@ -337,6 +366,7 @@ function runClaudeCli(
 	child.stderr?.setEncoding("utf8");
 
 	const updateDisplay = (nextText: string, delta: string) => {
+		resetIdleTimer();
 		displayText = nextText;
 		(partial.content[0] as TextContent).text = displayText;
 		stream.push({
@@ -465,6 +495,7 @@ function runClaudeCli(
 	};
 
 	child.stdout?.on("data", (chunk: string) => {
+		resetIdleTimer();
 		stdout += chunk;
 		lineBuffer += chunk;
 		let newlineIndex = lineBuffer.indexOf("\n");
@@ -478,6 +509,7 @@ function runClaudeCli(
 	});
 
 	child.stderr?.on("data", (chunk: string) => {
+		resetIdleTimer();
 		stderr += chunk;
 	});
 
@@ -514,13 +546,14 @@ function runClaudeCli(
 			return;
 		}
 
-		if (timedOut) {
-			const seconds = Math.ceil(timeoutMs / 1000);
+		if (idleTimedOut || maxRuntimeTimedOut) {
+			const seconds = Math.ceil((idleTimedOut ? idleTimeoutMs : (maxRuntimeMs ?? idleTimeoutMs)) / 1000);
+			const timeoutType = idleTimedOut ? "idle" : "max runtime";
 			const timedOutMessage = buildAssistantMessage(
 				model,
 				finalText || displayText,
 				"error",
-				`claude-cli timed out after ${seconds}s`,
+				`claude-cli ${timeoutType} timed out after ${seconds}s`,
 				finalUsage,
 				responseModel,
 			);
