@@ -150,9 +150,24 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
+			// Wrap withResponse() so that SDK-level retry exhaustion (e.g. 3×429)
+			// still fires onResponse with the error status before rethrowing.
+			// Without this, the OpenAI SDK throws instead of returning a response
+			// object, so onResponse/after_provider_response never fires and the
+			// router extension never writes a cooldown for the exhausted provider.
 			const { data: openaiStream, response } = await client.chat.completions
 				.create(params, requestOptions)
-				.withResponse();
+				.withResponse()
+				.catch(async (err: unknown) => {
+					const e = err as Record<string, unknown>;
+					if (typeof e?.status === "number" && options?.onResponse) {
+						const hdrs = e.headers instanceof Headers ? headersToRecord(e.headers as Headers) : {};
+						try {
+							await options.onResponse({ status: e.status as number, headers: hdrs }, model);
+						} catch {}
+					}
+					throw err;
+				});
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
