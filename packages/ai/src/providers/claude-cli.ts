@@ -174,10 +174,12 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: Abo
 	delete childEnv.ANTHROPIC_AUTH_TOKEN;
 	delete childEnv.ANTHROPIC_BASE_URL;
 
+	const home = process.env.HOME ?? "/root";
 	let child: ReturnType<typeof spawn>;
 	try {
 		child = spawn("claude", buildClaudeArgs(model, context, prompt), {
 			env: childEnv,
+			cwd: `${home}/projects/ahlnos`,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 	} catch (spawnErr) {
