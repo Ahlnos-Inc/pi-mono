@@ -20,11 +20,16 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * own native auth from ~/.claude/. This provider lets pi-ai treat that subprocess as an
  * ordinary stream-able provider.
  *
- * Limitations of `claude -p`:
- * - No tool calls (the subprocess returns plain text); declared `tools` in Context are ignored.
+ * Tool access: we pass `--tools default --permission-mode bypassPermissions` so that the
+ * subprocess has the same built-in toolset (Bash, Read, Edit, Write, Agent, …) as an
+ * interactive Claude Code session. `bypassPermissions` prevents interactive prompts that
+ * would hang an unattended subprocess. Key directories (Vault, ~/.pi, workspace) are added
+ * via `--add-dir` so the subprocess can read/write them without cwd assumptions.
+ *
+ * Remaining limitation:
  * - No streaming of partial deltas — the subprocess blocks until the response is ready, then
- *   writes it to stdout. We emit a single text_start / text_delta(full) / text_end sequence.
- *   (If `claude -p` ever gains a streaming mode, switch to chunked stdout reads.)
+ *   writes the final text to stdout. We emit a single text_start / text_delta(full) / text_end
+ *   sequence. Tool calls execute internally before stdout is written.
  * - System prompt is passed via `claude -p --append-system-prompt` when present.
  */
 
@@ -138,7 +143,22 @@ function buildAssistantMessage(
 }
 
 function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: string): string[] {
-	const args = ["-p", "--model", model.id];
+	const home = process.env.HOME ?? "/root";
+	const args = [
+		"-p",
+		"--model",
+		model.id,
+		"--tools",
+		"default",
+		"--permission-mode",
+		"bypassPermissions",
+		"--add-dir",
+		`${home}/Vault-V2`,
+		"--add-dir",
+		`${home}/.pi`,
+		"--add-dir",
+		`${home}/projects/ahlnos`,
+	];
 	const systemPrompt = context.systemPrompt;
 	if (systemPrompt?.trim()) args.push("--append-system-prompt", systemPrompt);
 	args.push(prompt);
