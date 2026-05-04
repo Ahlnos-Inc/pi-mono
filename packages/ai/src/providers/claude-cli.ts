@@ -39,6 +39,14 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * 10 covers a typical session worth of working context.
  */
 const MAX_PRIOR_TURNS = 10;
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const KILL_GRACE_MS = 5_000;
+
+function resolveTimeoutMs(timeoutMs?: number): number {
+	const envTimeout = Number.parseInt(process.env.PI_CLAUDE_CLI_TIMEOUT_MS ?? "", 10);
+	const resolved = timeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : DEFAULT_TIMEOUT_MS);
+	return Math.max(1, resolved);
+}
 
 function extractPrompt(context: Context): string {
 	// Anthropic's third-party-app gate returns 400 if the API request *structure* sent
@@ -165,9 +173,14 @@ function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: s
 	return args;
 }
 
-function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: AbortSignal) {
+function runClaudeCli(
+	model: Model<"claude-cli">,
+	context: Context,
+	options?: { signal?: AbortSignal; timeoutMs?: number },
+) {
 	const stream = createAssistantMessageEventStream();
 	const prompt = extractPrompt(context);
+	const timeoutMs = resolveTimeoutMs(options?.timeoutMs);
 
 	const childEnv: NodeJS.ProcessEnv = { ...process.env };
 	delete childEnv.ANTHROPIC_API_KEY;
@@ -193,6 +206,8 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: Abo
 	let stdout = "";
 	let stderr = "";
 	let aborted = false;
+	let timedOut = false;
+	let killTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const onAbort = () => {
 		aborted = true;
@@ -203,11 +218,33 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: Abo
 		}
 	};
 
-	if (signal) {
-		if (signal.aborted) {
+	const timeoutTimer = setTimeout(() => {
+		timedOut = true;
+		try {
+			child.kill("SIGTERM");
+		} catch {
+			/* noop */
+		}
+		killTimer = setTimeout(() => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				/* noop */
+			}
+		}, KILL_GRACE_MS);
+	}, timeoutMs);
+
+	const cleanup = () => {
+		clearTimeout(timeoutTimer);
+		if (killTimer) clearTimeout(killTimer);
+		if (options?.signal) options.signal.removeEventListener("abort", onAbort);
+	};
+
+	if (options?.signal) {
+		if (options.signal.aborted) {
 			onAbort();
 		} else {
-			signal.addEventListener("abort", onAbort, { once: true });
+			options.signal.addEventListener("abort", onAbort, { once: true });
 		}
 	}
 
@@ -235,18 +272,32 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: Abo
 	});
 
 	child.on("error", (err) => {
+		cleanup();
 		const errMessage = buildAssistantMessage(model, stdout, "error", `claude-cli error: ${err.message}`);
 		stream.push({ type: "error", reason: "error", error: errMessage });
 		stream.end(errMessage);
 	});
 
 	child.on("close", (code) => {
-		if (signal) signal.removeEventListener("abort", onAbort);
+		cleanup();
 
 		if (aborted) {
 			const aborted = buildAssistantMessage(model, stdout, "aborted", "claude-cli aborted");
 			stream.push({ type: "error", reason: "aborted", error: aborted });
 			stream.end(aborted);
+			return;
+		}
+
+		if (timedOut) {
+			const seconds = Math.ceil(timeoutMs / 1000);
+			const timedOutMessage = buildAssistantMessage(
+				model,
+				stdout,
+				"error",
+				`claude-cli timed out after ${seconds}s`,
+			);
+			stream.push({ type: "error", reason: "error", error: timedOutMessage });
+			stream.end(timedOutMessage);
 			return;
 		}
 
@@ -276,9 +327,9 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: Abo
 }
 
 export const streamClaudeCli: StreamFunction<"claude-cli", StreamOptions> = (model, context, options) => {
-	return runClaudeCli(model as Model<"claude-cli">, context, options?.signal);
+	return runClaudeCli(model as Model<"claude-cli">, context, options);
 };
 
 export const streamSimpleClaudeCli: StreamFunction<"claude-cli", SimpleStreamOptions> = (model, context, options) => {
-	return runClaudeCli(model as Model<"claude-cli">, context, options?.signal);
+	return runClaudeCli(model as Model<"claude-cli">, context, options);
 };

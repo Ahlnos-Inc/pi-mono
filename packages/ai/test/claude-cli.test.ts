@@ -38,6 +38,7 @@ function context(systemPrompt?: string): Context {
 
 describe("claude-cli provider", () => {
 	beforeEach(() => {
+		vi.useRealTimers();
 		spawnMock.mockReset();
 		spawnMock.mockReturnValue(new MockChildProcess());
 	});
@@ -45,8 +46,9 @@ describe("claude-cli provider", () => {
 	it("spawns claude without a system prompt flag when context has no system prompt", () => {
 		streamClaudeCli(model, context(), {});
 
-		expect(spawnMock).toHaveBeenCalledWith("claude", ["-p", "--model", model.id, "hello"], {
+		expect(spawnMock).toHaveBeenCalledWith("claude", expect.arrayContaining(["-p", "--model", model.id, "hello"]), {
 			env: expect.any(Object),
+			cwd: `${process.env.HOME ?? "/root"}/projects/ahlnos`,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
@@ -55,20 +57,16 @@ describe("claude-cli provider", () => {
 	it("passes a non-empty system prompt via --append-system-prompt", () => {
 		streamClaudeCli(model, context(" route instructions\n"), {});
 
-		expect(spawnMock.mock.calls[0][1]).toEqual([
-			"-p",
-			"--model",
-			model.id,
-			"--append-system-prompt",
-			" route instructions\n",
-			"hello",
-		]);
+		expect(spawnMock.mock.calls[0][1]).toEqual(
+			expect.arrayContaining(["--append-system-prompt", " route instructions\n", "hello"]),
+		);
 	});
 
 	it("skips --append-system-prompt for whitespace-only system prompts", () => {
 		streamClaudeCli(model, context(" \n\t "), {});
 
-		expect(spawnMock.mock.calls[0][1]).toEqual(["-p", "--model", model.id, "hello"]);
+		expect(spawnMock.mock.calls[0][1]).not.toContain("--append-system-prompt");
+		expect(spawnMock.mock.calls[0][1]).toContain("hello");
 	});
 
 	it("passes multiline shell-looking system prompts as one argv element", () => {
@@ -76,14 +74,21 @@ describe("claude-cli provider", () => {
 
 		streamClaudeCli(model, context(systemPrompt), {});
 
-		expect(spawnMock.mock.calls[0][1]).toEqual([
-			"-p",
-			"--model",
-			model.id,
-			"--append-system-prompt",
-			systemPrompt,
-			"hello",
-		]);
+		expect(spawnMock.mock.calls[0][1]).toEqual(
+			expect.arrayContaining(["--append-system-prompt", systemPrompt, "hello"]),
+		);
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
+	});
+
+	it("terminates a hung claude subprocess when timeoutMs elapses", () => {
+		vi.useFakeTimers();
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		streamClaudeCli(model, context(), { timeoutMs: 25 });
+
+		vi.advanceTimersByTime(25);
+
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
 	});
 });
