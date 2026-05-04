@@ -25,8 +25,7 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * - No streaming of partial deltas — the subprocess blocks until the response is ready, then
  *   writes it to stdout. We emit a single text_start / text_delta(full) / text_end sequence.
  *   (If `claude -p` ever gains a streaming mode, switch to chunked stdout reads.)
- * - System prompt is prepended to the user message rather than passed as a flag, since
- *   `claude -p`'s --append-system-prompt is opt-in and version-dependent.
+ * - System prompt is passed via `claude -p --append-system-prompt` when present.
  */
 
 /**
@@ -138,6 +137,14 @@ function buildAssistantMessage(
 	};
 }
 
+function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: string): string[] {
+	const args = ["-p", "--model", model.id];
+	const systemPrompt = context.systemPrompt;
+	if (systemPrompt?.trim()) args.push("--append-system-prompt", systemPrompt);
+	args.push(prompt);
+	return args;
+}
+
 function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: AbortSignal) {
 	const stream = createAssistantMessageEventStream();
 	const prompt = extractPrompt(context);
@@ -149,7 +156,7 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, signal?: Abo
 
 	let child: ReturnType<typeof spawn>;
 	try {
-		child = spawn("claude", ["-p", "--model", model.id, prompt], {
+		child = spawn("claude", buildClaudeArgs(model, context, prompt), {
 			env: childEnv,
 			stdio: ["ignore", "pipe", "pipe"],
 		});

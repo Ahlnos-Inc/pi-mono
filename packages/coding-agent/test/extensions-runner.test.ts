@@ -568,7 +568,7 @@ describe("ExtensionRunner", () => {
 				export default function(pi) {
 					pi.on("before_agent_start", async (_event, ctx) => {
 						return {
-							systemPrompt: ctx.getSystemPrompt() + "\\nfirst",
+							systemPrompt: "first\\n\\n" + ctx.getSystemPrompt(),
 						};
 					});
 				}
@@ -577,7 +577,7 @@ describe("ExtensionRunner", () => {
 				export default function(pi) {
 					pi.on("before_agent_start", async (_event, ctx) => {
 						return {
-							systemPrompt: ctx.getSystemPrompt() + "\\nsecond",
+							systemPrompt: ctx.getSystemPrompt() + "\\n\\nsecond",
 						};
 					});
 				}
@@ -601,7 +601,7 @@ describe("ExtensionRunner", () => {
 
 			expect(chained).toEqual({
 				messages: undefined,
-				systemPrompt: "base\nfirst\nsecond",
+				systemPrompt: "first\n\nbase\n\nsecond",
 			});
 		});
 	});
