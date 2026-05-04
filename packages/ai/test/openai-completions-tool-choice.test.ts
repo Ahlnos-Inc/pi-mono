@@ -239,6 +239,43 @@ describe("openai-completions tool_choice", () => {
 		expect(params.reasoning_effort).toBeUndefined();
 	});
 
+	it("does not send tools to Groq Compound models", async () => {
+		const model = getModel("groq", "groq/compound-mini")!;
+		const tools: Tool[] = [
+			{
+				name: "ping",
+				description: "Ping tool",
+				parameters: Type.Object({
+					ok: Type.Boolean(),
+				}),
+			},
+		];
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						content: "Hi",
+						timestamp: Date.now(),
+					},
+				],
+				tools,
+			},
+			{
+				apiKey: "test",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as { tools?: unknown[] };
+		expect(params.tools).toBeUndefined();
+	});
+
 	it("enables tool_stream for supported z.ai models with tools", async () => {
 		const model = getModel("zai", "glm-5.1")!;
 		const tools: Tool[] = [
