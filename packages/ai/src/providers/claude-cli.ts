@@ -8,6 +8,7 @@ import type {
 	StreamFunction,
 	StreamOptions,
 	TextContent,
+	Usage,
 } from "../types.js";
 import { createAssistantMessageEventStream } from "../utils/event-stream.js";
 
@@ -26,11 +27,12 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * would hang an unattended subprocess. Key directories (Vault, ~/.pi, workspace) are added
  * via `--add-dir` so the subprocess can read/write them without cwd assumptions.
  *
- * Remaining limitation:
- * - No streaming of partial deltas — the subprocess blocks until the response is ready, then
- *   writes the final text to stdout. We emit a single text_start / text_delta(full) / text_end
- *   sequence. Tool calls execute internally before stdout is written.
- * - System prompt is passed via `claude -p --append-system-prompt` when present.
+ * Streaming: claude is invoked with `--output-format stream-json`, which emits JSONL records
+ * for model deltas, tool calls, tool results, lifecycle status, and the final result. Pi still
+ * treats claude-cli as one provider call: Claude's internal tool calls are surfaced as compact
+ * activity text only, never as Pi ToolCall blocks, so Pi does not re-execute them.
+ *
+ * System prompt is passed via `claude -p --append-system-prompt` when present.
  */
 
 /**
@@ -129,6 +131,8 @@ function buildAssistantMessage(
 	text: string,
 	stopReason: AssistantMessage["stopReason"],
 	errorMessage?: string,
+	usage?: Usage,
+	responseModel?: string,
 ): AssistantMessage {
 	return {
 		role: "assistant",
@@ -136,7 +140,8 @@ function buildAssistantMessage(
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
-		usage: {
+		responseModel,
+		usage: usage ?? {
 			input: 0,
 			output: 0,
 			cacheRead: 0,
@@ -154,6 +159,10 @@ function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: s
 	const home = process.env.HOME ?? "/root";
 	const args = [
 		"-p",
+		"--verbose",
+		"--output-format",
+		"stream-json",
+		"--include-partial-messages",
 		"--model",
 		model.id,
 		"--tools",
@@ -171,6 +180,71 @@ function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: s
 	if (systemPrompt?.trim()) args.push("--append-system-prompt", systemPrompt);
 	args.push(prompt);
 	return args;
+}
+
+type ClaudeCliJson = Record<string, any>;
+
+type ClaudeCliContentBlockState =
+	| { type: "text"; text: string }
+	| { type: "thinking"; text: string }
+	| { type: "tool_use"; id?: string; name?: string; inputJson: string; announcedInput: boolean }
+	| { type: string; name?: string; text?: string; inputJson?: string; announcedInput?: boolean };
+
+function parseJsonLine(line: string): ClaudeCliJson | undefined {
+	const trimmed = line.trim();
+	if (!trimmed) return undefined;
+	try {
+		return JSON.parse(trimmed) as ClaudeCliJson;
+	} catch {
+		return undefined;
+	}
+}
+
+function numberValue(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function usageFromClaudeResult(result: ClaudeCliJson): Usage | undefined {
+	const usage = result.usage;
+	if (!usage || typeof usage !== "object") return undefined;
+
+	const input = numberValue(usage.input_tokens);
+	const output = numberValue(usage.output_tokens);
+	const cacheRead = numberValue(usage.cache_read_input_tokens);
+	const cacheWrite = numberValue(usage.cache_creation_input_tokens);
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		totalTokens: input + output + cacheRead + cacheWrite,
+		cost: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			// Claude CLI runs through the user's Claude Code subscription auth. It reports
+			// an estimated USD value in stream-json, but Pi should not present that as
+			// billable API spend.
+			total: 0,
+		},
+	};
+}
+
+function summarizeToolInput(toolName: string | undefined, input: unknown): string | undefined {
+	if (!input || typeof input !== "object") return undefined;
+	const record = input as Record<string, unknown>;
+	if (toolName === "Bash" && typeof record.command === "string") return record.command;
+	if ((toolName === "Read" || toolName === "Edit" || toolName === "Write") && typeof record.file_path === "string") {
+		return record.file_path;
+	}
+	if ((toolName === "Grep" || toolName === "Glob") && typeof record.pattern === "string") return record.pattern;
+	if (toolName === "Task" && typeof record.description === "string") return record.description;
+	return undefined;
+}
+
+function activityLine(text: string): string {
+	return `[claude-cli] ${text}\n`;
 }
 
 function runClaudeCli(
@@ -205,9 +279,15 @@ function runClaudeCli(
 
 	let stdout = "";
 	let stderr = "";
+	let lineBuffer = "";
+	let finalText = "";
+	let displayText = "";
+	let responseModel: string | undefined;
+	let finalUsage: Usage | undefined;
 	let aborted = false;
 	let timedOut = false;
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
+	const blocks = new Map<number, ClaudeCliContentBlockState>();
 
 	const onAbort = () => {
 		aborted = true;
@@ -256,15 +336,145 @@ function runClaudeCli(
 	child.stdout?.setEncoding("utf8");
 	child.stderr?.setEncoding("utf8");
 
-	child.stdout?.on("data", (chunk: string) => {
-		stdout += chunk;
-		(partial.content[0] as TextContent).text = stdout;
+	const updateDisplay = (nextText: string, delta: string) => {
+		displayText = nextText;
+		(partial.content[0] as TextContent).text = displayText;
 		stream.push({
 			type: "text_delta",
 			contentIndex: 0,
-			delta: chunk,
-			partial: { ...partial, content: [{ type: "text", text: stdout }] },
+			delta,
+			partial: { ...partial, content: [{ type: "text", text: displayText }] },
 		});
+	};
+
+	const appendActivity = (text: string) => {
+		if (finalText) return;
+		const line = activityLine(text);
+		updateDisplay(displayText + line, line);
+	};
+
+	const handleClaudeEvent = (event: ClaudeCliJson) => {
+		if (event.type === "system") {
+			if (event.subtype === "init") {
+				responseModel = typeof event.model === "string" ? event.model : responseModel;
+				const toolCount = Array.isArray(event.tools) ? event.tools.length : undefined;
+				appendActivity(
+					toolCount ? `initialized ${event.model ?? model.id} with ${toolCount} tools` : "initialized",
+				);
+			} else if (event.subtype === "status" && typeof event.status === "string") {
+				appendActivity(event.status === "requesting" ? "requesting model response" : event.status);
+			}
+			return;
+		}
+
+		if (event.type === "stream_event" && event.event && typeof event.event === "object") {
+			const streamEvent = event.event as ClaudeCliJson;
+			if (streamEvent.type === "message_start") {
+				const messageModel = streamEvent.message?.model;
+				if (typeof messageModel === "string") responseModel = messageModel;
+				appendActivity(`model turn started (${responseModel ?? model.id})`);
+				return;
+			}
+
+			if (streamEvent.type === "content_block_start") {
+				const index = numberValue(streamEvent.index);
+				const block = streamEvent.content_block as ClaudeCliJson | undefined;
+				const blockType = typeof block?.type === "string" ? block.type : "unknown";
+				if (blockType === "text") {
+					blocks.set(index, { type: "text", text: "" });
+					if (!finalText && displayText) updateDisplay("", "");
+				} else if (blockType === "thinking") {
+					blocks.set(index, { type: "thinking", text: "" });
+				} else if (blockType === "tool_use") {
+					const toolName = typeof block?.name === "string" ? block.name : "tool";
+					blocks.set(index, {
+						type: "tool_use",
+						id: typeof block?.id === "string" ? block.id : undefined,
+						name: toolName,
+						inputJson: "",
+						announcedInput: false,
+					});
+					appendActivity(`preparing ${toolName}`);
+				} else {
+					blocks.set(index, { type: blockType });
+				}
+				return;
+			}
+
+			if (streamEvent.type === "content_block_delta") {
+				const index = numberValue(streamEvent.index);
+				const block = blocks.get(index);
+				const delta = streamEvent.delta as ClaudeCliJson | undefined;
+				if (!block || !delta) return;
+				if (block.type === "text" && delta.type === "text_delta" && typeof delta.text === "string") {
+					finalText += delta.text;
+					updateDisplay(finalText, delta.text);
+					return;
+				}
+				if (
+					block.type === "tool_use" &&
+					delta.type === "input_json_delta" &&
+					typeof delta.partial_json === "string"
+				) {
+					block.inputJson = `${block.inputJson ?? ""}${delta.partial_json}`;
+					if (!block.announcedInput) {
+						try {
+							const input = JSON.parse(block.inputJson);
+							const summary = summarizeToolInput(block.name, input);
+							appendActivity(summary ? `running ${block.name}: ${summary}` : `running ${block.name}`);
+							block.announcedInput = true;
+						} catch {
+							// Wait until the streamed JSON object is complete enough to summarize.
+						}
+					}
+				}
+				return;
+			}
+
+			if (streamEvent.type === "content_block_stop") {
+				const index = numberValue(streamEvent.index);
+				const block = blocks.get(index);
+				if (block?.type === "tool_use" && !block.announcedInput) appendActivity(`running ${block.name ?? "tool"}`);
+				blocks.delete(index);
+				return;
+			}
+
+			if (streamEvent.type === "message_delta" && streamEvent.delta?.stop_reason === "tool_use") {
+				appendActivity("waiting for tool result");
+			}
+			return;
+		}
+
+		if (event.type === "user" && event.tool_use_result && typeof event.tool_use_result === "object") {
+			const result = event.tool_use_result as ClaudeCliJson;
+			const errored = result.is_error === true || result.interrupted === true;
+			appendActivity(errored ? "tool returned an error" : "tool completed");
+			return;
+		}
+
+		if (event.type === "assistant") {
+			const messageModel = event.message?.model;
+			if (typeof messageModel === "string") responseModel = messageModel;
+			return;
+		}
+
+		if (event.type === "result") {
+			if (typeof event.result === "string") finalText = event.result;
+			finalUsage = usageFromClaudeResult(event);
+		}
+	};
+
+	child.stdout?.on("data", (chunk: string) => {
+		stdout += chunk;
+		lineBuffer += chunk;
+		let newlineIndex = lineBuffer.indexOf("\n");
+		while (newlineIndex !== -1) {
+			const line = lineBuffer.slice(0, newlineIndex);
+			lineBuffer = lineBuffer.slice(newlineIndex + 1);
+			const parsed = parseJsonLine(line);
+			if (parsed) handleClaudeEvent(parsed);
+			newlineIndex = lineBuffer.indexOf("\n");
+		}
 	});
 
 	child.stderr?.on("data", (chunk: string) => {
@@ -273,16 +483,32 @@ function runClaudeCli(
 
 	child.on("error", (err) => {
 		cleanup();
-		const errMessage = buildAssistantMessage(model, stdout, "error", `claude-cli error: ${err.message}`);
+		const errMessage = buildAssistantMessage(
+			model,
+			finalText || displayText,
+			"error",
+			`claude-cli error: ${err.message}`,
+			finalUsage,
+			responseModel,
+		);
 		stream.push({ type: "error", reason: "error", error: errMessage });
 		stream.end(errMessage);
 	});
 
 	child.on("close", (code) => {
 		cleanup();
+		const trailing = parseJsonLine(lineBuffer);
+		if (trailing) handleClaudeEvent(trailing);
 
 		if (aborted) {
-			const aborted = buildAssistantMessage(model, stdout, "aborted", "claude-cli aborted");
+			const aborted = buildAssistantMessage(
+				model,
+				finalText || displayText,
+				"aborted",
+				"claude-cli aborted",
+				finalUsage,
+				responseModel,
+			);
 			stream.push({ type: "error", reason: "aborted", error: aborted });
 			stream.end(aborted);
 			return;
@@ -292,9 +518,11 @@ function runClaudeCli(
 			const seconds = Math.ceil(timeoutMs / 1000);
 			const timedOutMessage = buildAssistantMessage(
 				model,
-				stdout,
+				finalText || displayText,
 				"error",
 				`claude-cli timed out after ${seconds}s`,
+				finalUsage,
+				responseModel,
 			);
 			stream.push({ type: "error", reason: "error", error: timedOutMessage });
 			stream.end(timedOutMessage);
@@ -303,22 +531,36 @@ function runClaudeCli(
 
 		if (code !== 0) {
 			const errMsg = stderr.trim() || `claude -p exited with code ${code}`;
-			const errMessage = buildAssistantMessage(model, stdout, "error", errMsg);
+			const errMessage = buildAssistantMessage(
+				model,
+				finalText || displayText || stdout,
+				"error",
+				errMsg,
+				finalUsage,
+				responseModel,
+			);
 			stream.push({ type: "error", reason: "error", error: errMessage });
 			stream.end(errMessage);
 			return;
 		}
 
-		const finalText = stdout.trimEnd();
-		(partial.content[0] as TextContent).text = finalText;
+		const resolvedFinalText = finalText.trimEnd();
+		(partial.content[0] as TextContent).text = resolvedFinalText;
 		stream.push({
 			type: "text_end",
 			contentIndex: 0,
-			content: finalText,
-			partial: { ...partial, content: [{ type: "text", text: finalText }] },
+			content: resolvedFinalText,
+			partial: { ...partial, content: [{ type: "text", text: resolvedFinalText }] },
 		});
 
-		const finalMessage = buildAssistantMessage(model, finalText, "stop");
+		const finalMessage = buildAssistantMessage(
+			model,
+			resolvedFinalText,
+			"stop",
+			undefined,
+			finalUsage,
+			responseModel,
+		);
 		stream.push({ type: "done", reason: "stop", message: finalMessage });
 		stream.end(finalMessage);
 	});
