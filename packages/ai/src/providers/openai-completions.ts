@@ -1054,6 +1054,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 	const isMoonshot = provider === "moonshotai" || provider === "moonshotai-cn" || baseUrl.includes("api.moonshot.");
 	const isCloudflareWorkersAI = provider === "cloudflare-workers-ai" || baseUrl.includes("api.cloudflare.com");
 	const isCloudflareAiGateway = provider === "cloudflare-ai-gateway" || baseUrl.includes("gateway.ai.cloudflare.com");
+	const isGroqCompound = provider === "groq" && /^groq\/compound(?:-mini)?$/.test(model.id);
 
 	const isNonStandard =
 		provider === "cerebras" ||
@@ -1078,7 +1079,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 	return {
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
-		supportsReasoningEffort: !isGrok && !isZai && !isMoonshot && !isCloudflareAiGateway,
+		supportsReasoningEffort: !isGrok && !isZai && !isMoonshot && !isCloudflareAiGateway && !isGroqCompound,
 		supportsUsageInStreaming: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: false,

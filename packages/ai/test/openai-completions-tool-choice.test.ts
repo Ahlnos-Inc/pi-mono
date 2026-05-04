@@ -211,6 +211,34 @@ describe("openai-completions tool_choice", () => {
 		expect(params.reasoning_effort).toBe("medium");
 	});
 
+	it("does not send reasoning_effort to Groq Compound models", async () => {
+		const model = getModel("groq", "groq/compound-mini")!;
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						content: "Hi",
+						timestamp: Date.now(),
+					},
+				],
+			},
+			{
+				apiKey: "test",
+				reasoning: "medium",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as { reasoning_effort?: string };
+		expect(params.reasoning_effort).toBeUndefined();
+	});
+
 	it("enables tool_stream for supported z.ai models with tools", async () => {
 		const model = getModel("zai", "glm-5.1")!;
 		const tools: Tool[] = [
