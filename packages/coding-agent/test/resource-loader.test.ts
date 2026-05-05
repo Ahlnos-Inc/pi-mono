@@ -15,8 +15,10 @@ describe("DefaultResourceLoader", () => {
 	let tempDir: string;
 	let agentDir: string;
 	let cwd: string;
+	let originalHome: string | undefined;
 
 	beforeEach(() => {
+		originalHome = process.env.HOME;
 		tempDir = join(tmpdir(), `rl-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
 		cwd = join(tempDir, "project");
@@ -25,6 +27,11 @@ describe("DefaultResourceLoader", () => {
 	});
 
 	afterEach(() => {
+		if (originalHome === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = originalHome;
+		}
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -76,6 +83,28 @@ Skill content here.`,
 			const { skills, diagnostics } = loader.getSkills();
 			expect(skills.some((s) => s.name === "browser-tools")).toBe(true);
 			expect(diagnostics.some((d) => d.path?.endsWith("EFFICIENCY.md"))).toBe(false);
+		});
+
+		it("should discover Pi-native skills from the Pi root when using the default agent dir", async () => {
+			process.env.HOME = tempDir;
+			agentDir = join(tempDir, ".pi", "agent");
+			const skillDir = join(tempDir, ".pi", "skills", "excalidraw-diagram");
+			mkdirSync(skillDir, { recursive: true });
+			writeFileSync(
+				join(skillDir, "SKILL.md"),
+				`---
+name: excalidraw-diagram
+description: Edit Excalidraw diagrams
+---
+Skill content here.`,
+			);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+
+			const skill = loader.getSkills().skills.find((s) => s.name === "excalidraw-diagram");
+			expect(skill?.filePath).toBe(join(skillDir, "SKILL.md"));
+			expect(skill?.sourceInfo.scope).toBe("user");
 		});
 
 		it("should discover prompts from agentDir", async () => {

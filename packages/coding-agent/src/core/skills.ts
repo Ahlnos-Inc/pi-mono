@@ -407,6 +407,8 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 
 	// Resolve agentDir - if not provided, use default from config
 	const resolvedAgentDir = agentDir ?? getAgentDir();
+	const piRootSkillsDir = join(homedir(), CONFIG_DIR_NAME, "skills");
+	const shouldLoadPiRootSkills = resolve(resolvedAgentDir) === resolve(join(homedir(), CONFIG_DIR_NAME, "agent"));
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
@@ -445,6 +447,9 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	}
 
 	if (includeDefaults) {
+		if (shouldLoadPiRootSkills) {
+			addSkills(loadSkillsFromDirInternal(piRootSkillsDir, "user", true));
+		}
 		addSkills(loadSkillsFromDirInternal(join(resolvedAgentDir, "skills"), "user", true));
 		addSkills(loadSkillsFromDirInternal(resolve(cwd, CONFIG_DIR_NAME, "skills"), "project", true));
 	}

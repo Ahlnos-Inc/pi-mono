@@ -2157,6 +2157,9 @@ export class DefaultPackageManager implements PackageManager {
 			prompts: join(globalBaseDir, "prompts"),
 			themes: join(globalBaseDir, "themes"),
 		};
+		const userPiRoot = join(getHomeDir(), CONFIG_DIR_NAME);
+		const userPiRootSkillsDir = join(userPiRoot, "skills");
+		const shouldLoadPiRootSkills = resolve(globalBaseDir) === resolve(join(getHomeDir(), CONFIG_DIR_NAME, "agent"));
 		const projectDirs = {
 			extensions: join(projectBaseDir, "extensions"),
 			skills: join(projectBaseDir, "skills"),
@@ -2221,6 +2224,15 @@ export class DefaultPackageManager implements PackageManager {
 			userOverrides.extensions,
 			globalBaseDir,
 		);
+		if (shouldLoadPiRootSkills) {
+			addResources(
+				"skills",
+				collectAutoSkillEntries(userPiRootSkillsDir, "pi"),
+				{ ...userMetadata, baseDir: userPiRoot },
+				userOverrides.skills,
+				userPiRoot,
+			);
+		}
 		addResources(
 			"skills",
 			[...collectAutoSkillEntries(userDirs.skills, "pi"), ...collectAutoSkillEntries(userAgentsSkillsDir, "agents")],
