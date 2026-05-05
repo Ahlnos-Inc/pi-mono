@@ -384,7 +384,14 @@ function collectSkillEntries(
 			}
 
 			const relPath = toPosixPath(relative(root, fullPath));
-			if (mode === "pi" && dir === root && isFile && entry.name.endsWith(".md") && !ig.ignores(relPath)) {
+			if (
+				mode === "pi" &&
+				dir === root &&
+				isFile &&
+				entry.name.endsWith(".md") &&
+				entry.name.toLowerCase() !== "readme.md" &&
+				!ig.ignores(relPath)
+			) {
 				entries.push(fullPath);
 				continue;
 			}

@@ -88,6 +88,9 @@ Skill content here.`,
 		it("should discover Pi-native skills from the Pi root when using the default agent dir", async () => {
 			process.env.HOME = tempDir;
 			agentDir = join(tempDir, ".pi", "agent");
+			const piSkillsDir = join(tempDir, ".pi", "skills");
+			mkdirSync(piSkillsDir, { recursive: true });
+			writeFileSync(join(piSkillsDir, "README.md"), "# Pi Skills");
 			const skillDir = join(tempDir, ".pi", "skills", "excalidraw-diagram");
 			mkdirSync(skillDir, { recursive: true });
 			writeFileSync(
@@ -105,6 +108,7 @@ Skill content here.`,
 			const skill = loader.getSkills().skills.find((s) => s.name === "excalidraw-diagram");
 			expect(skill?.filePath).toBe(join(skillDir, "SKILL.md"));
 			expect(skill?.sourceInfo.scope).toBe("user");
+			expect(loader.getSkills().diagnostics.some((d) => d.path?.endsWith("README.md"))).toBe(false);
 		});
 
 		it("should discover prompts from agentDir", async () => {
