@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type CompactionSettings,
 	calculateContextTokens,
+	calculateProviderContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
@@ -183,6 +184,11 @@ describe("Token calculation", () => {
 	it("should ignore prompt-cache tokens for active context", () => {
 		const usage = createMockUsage(9, 464, 153_667, 30_249);
 		expect(calculateContextTokens(usage)).toBe(473);
+	});
+
+	it("should include prompt-cache tokens for provider context pressure", () => {
+		const usage = createMockUsage(9, 464, 153_667, 30_249);
+		expect(calculateProviderContextTokens(usage)).toBe(184_389);
 	});
 
 	it("should handle zero values", () => {

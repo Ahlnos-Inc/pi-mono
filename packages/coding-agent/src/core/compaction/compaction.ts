@@ -138,6 +138,16 @@ export function calculateContextTokens(usage: Usage): number {
 }
 
 /**
+ * Calculate provider-reported context pressure from usage.
+ * Cache read/write tokens still occupy provider context even when they are
+ * discounted or reused by prompt caching. Use this for status display, not for
+ * Pi auto-compaction decisions.
+ */
+export function calculateProviderContextTokens(usage: Usage): number {
+	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+/**
  * Get usage from an assistant message if available.
  * Skips aborted and error messages as they don't have valid usage data.
  */
@@ -201,6 +211,29 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	}
 
 	const usageTokens = calculateContextTokens(usageInfo.usage);
+	let trailingTokens = 0;
+	for (let i = usageInfo.index + 1; i < messages.length; i++) {
+		trailingTokens += estimateTokens(messages[i]);
+	}
+
+	return {
+		tokens: usageTokens + trailingTokens,
+		usageTokens,
+		trailingTokens,
+		lastUsageIndex: usageInfo.index,
+	};
+}
+
+/**
+ * Estimate provider-visible context pressure for display. This includes cached
+ * provider prompt tokens from the latest usage record, then adds any local
+ * trailing messages that have not yet been sent to a model.
+ */
+export function estimateProviderContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	const usageInfo = getLastAssistantUsageInfo(messages);
+	if (!usageInfo) return estimateContextTokens(messages);
+
+	const usageTokens = calculateProviderContextTokens(usageInfo.usage);
 	let trailingTokens = 0;
 	for (let i = usageInfo.index + 1; i < messages.length; i++) {
 		trailingTokens += estimateTokens(messages[i]);

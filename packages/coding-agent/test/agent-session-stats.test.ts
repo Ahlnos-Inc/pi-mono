@@ -10,13 +10,13 @@ import { createTestResourceLoader } from "./utilities.js";
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
 
-function createUsage(totalTokens: number): Usage {
+function createUsage(totalTokens: number, cacheRead = 0, cacheWrite = 0): Usage {
 	return {
 		input: totalTokens,
 		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens,
+		cacheRead,
+		cacheWrite,
+		totalTokens: totalTokens + cacheRead + cacheWrite,
 		cost: {
 			input: 0,
 			output: 0,
@@ -27,14 +27,20 @@ function createUsage(totalTokens: number): Usage {
 	};
 }
 
-function createAssistantMessage(text: string, totalTokens: number, timestamp: number): AssistantMessage {
+function createAssistantMessage(
+	text: string,
+	totalTokens: number,
+	timestamp: number,
+	cacheRead = 0,
+	cacheWrite = 0,
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
-		usage: createUsage(totalTokens),
+		usage: createUsage(totalTokens, cacheRead, cacheWrite),
 		stopReason: "stop",
 		timestamp,
 	};
@@ -136,6 +142,23 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBe(25_000);
 			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("reports provider-visible context pressure including prompt cache tokens", () => {
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.appendMessage(createUserMessage("small prompt", 1));
+			sessionManager.appendMessage(createAssistantMessage("small response", 473, 2, 153_667, 30_249));
+			syncAgentMessages(session, sessionManager);
+
+			const stats = session.getSessionStats();
+			expect(stats.contextUsage).toBeDefined();
+			expect(stats.contextUsage?.tokens).toBe(184_389);
+			expect(stats.contextUsage?.percent).toBe((184_389 / model.contextWindow) * 100);
 		} finally {
 			session.dispose();
 		}

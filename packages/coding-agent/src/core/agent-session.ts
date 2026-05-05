@@ -43,6 +43,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateProviderContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -2989,7 +2990,7 @@ export class AgentSession {
 			}
 		}
 
-		const estimate = estimateContextTokens(this.messages);
+		const estimate = estimateProviderContextTokens(this.messages);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
 		return {
