@@ -18,7 +18,7 @@ vi.mock("../src/core/compaction/index.js", () => ({
 		cacheRead: number;
 		cacheWrite: number;
 		totalTokens?: number;
-	}) => usage.totalTokens ?? usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+	}) => usage.input + usage.output,
 	collectEntriesForBranchSummary: () => ({ entries: [], commonAncestorId: null }),
 	compact: async () => ({
 		summary: "compacted",
@@ -37,8 +37,7 @@ vi.mock("../src/core/compaction/index.js", () => ({
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const msg = messages[i];
 			if (msg.role === "assistant" && msg.stopReason !== "error" && msg.stopReason !== "aborted" && msg.usage) {
-				const tokens =
-					msg.usage.totalTokens ?? msg.usage.input + msg.usage.output + msg.usage.cacheRead + msg.usage.cacheWrite;
+				const tokens = msg.usage.input + msg.usage.output;
 				return { tokens, usageTokens: tokens, trailingTokens: 0, lastUsageIndex: i };
 			}
 		}

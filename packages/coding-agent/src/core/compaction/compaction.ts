@@ -129,11 +129,12 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 // ============================================================================
 
 /**
- * Calculate total context tokens from usage.
- * Uses the native totalTokens field when available, falls back to computing from components.
+ * Calculate active context tokens from usage.
+ * Prompt-cache read/write counters are cache telemetry, not additional live
+ * context tokens, so they must not drive footer context or compaction.
  */
 export function calculateContextTokens(usage: Usage): number {
-	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+	return usage.input + usage.output;
 }
 
 /**

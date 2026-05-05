@@ -175,9 +175,14 @@ function extractText(messages: AgentMessage[]): string {
 // ============================================================================
 
 describe("Token calculation", () => {
-	it("should calculate total context tokens from usage", () => {
+	it("should calculate active context tokens from usage", () => {
 		const usage = createMockUsage(1000, 500, 200, 100);
-		expect(calculateContextTokens(usage)).toBe(1800);
+		expect(calculateContextTokens(usage)).toBe(1500);
+	});
+
+	it("should ignore prompt-cache tokens for active context", () => {
+		const usage = createMockUsage(9, 464, 153_667, 30_249);
+		expect(calculateContextTokens(usage)).toBe(473);
 	});
 
 	it("should handle zero values", () => {
