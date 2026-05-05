@@ -396,6 +396,20 @@ describe("buildSessionContext", () => {
 });
 
 describe("prepareCompaction with previous compaction", () => {
+	it("should not prepare a no-op compaction when all visible messages are still kept", () => {
+		const entries: SessionEntry[] = [
+			createModelChangeEntry("claude-cli", "claude-opus-4-7"),
+			createMessageEntry(createUserMessage("Do the vault diagram remediation.")),
+			createMessageEntry(
+				createAssistantMessage("Completed the remediation summary.", createMockUsage(10, 1738, 223861, 38023)),
+			),
+		];
+
+		const preparation = prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS);
+
+		expect(preparation).toBeUndefined();
+	});
+
 	it("should preserve kept messages across repeated compactions when they still fit", () => {
 		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1)"));
 		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1"));

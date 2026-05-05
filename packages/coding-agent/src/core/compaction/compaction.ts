@@ -676,6 +676,10 @@ export function prepareCompaction(
 		}
 	}
 
+	if (!previousSummary && messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
+		return undefined;
+	}
+
 	return {
 		firstKeptEntryId,
 		messagesToSummarize,

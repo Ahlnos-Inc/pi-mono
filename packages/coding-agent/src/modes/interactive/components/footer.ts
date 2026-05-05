@@ -86,8 +86,8 @@ export class FooterComponent implements Component {
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
-		const contextPercentValue = contextUsage?.percent ?? 0;
-		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+		const contextPercentValue = contextUsage?.percent ?? null;
+		const contextPercent = contextPercentValue !== null ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
 		let pwd = this.session.sessionManager.getCwd();
@@ -129,9 +129,9 @@ export class FooterComponent implements Component {
 			contextPercent === "?"
 				? `?/${formatTokens(contextWindow)}${autoIndicator}`
 				: `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
-		if (contextPercentValue > 90) {
+		if (contextPercentValue !== null && contextPercentValue > 90) {
 			contextPercentStr = theme.fg("error", contextPercentDisplay);
-		} else if (contextPercentValue > 70) {
+		} else if (contextPercentValue !== null && contextPercentValue > 70) {
 			contextPercentStr = theme.fg("warning", contextPercentDisplay);
 		} else {
 			contextPercentStr = contextPercentDisplay;

@@ -20,6 +20,7 @@ function createSession(options: {
 	reasoning?: boolean;
 	thinkingLevel?: string;
 	usage?: AssistantUsage;
+	contextUsage?: { contextWindow: number; percent: number | null };
 }): AgentSession {
 	const usage = options.usage;
 	const entries =
@@ -50,7 +51,7 @@ function createSession(options: {
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
-		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
+		getContextUsage: () => options.contextUsage,
 		modelRegistry: {
 			isUsingOAuth: () => false,
 		},
@@ -111,5 +112,20 @@ describe("FooterComponent width handling", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
+	});
+
+	it("does not render unknown context usage as 0%", () => {
+		const footerWithoutUsage = new FooterComponent(createSession({ sessionName: "" }), createFooterData(1));
+		const outputWithoutUsage = footerWithoutUsage.render(120).join("\n");
+		expect(outputWithoutUsage).toContain("?/200k");
+		expect(outputWithoutUsage).not.toContain("0.0%/200k");
+
+		const footerWithUnknownUsage = new FooterComponent(
+			createSession({ sessionName: "", contextUsage: { contextWindow: 200_000, percent: null } }),
+			createFooterData(1),
+		);
+		const outputWithUnknownUsage = footerWithUnknownUsage.render(120).join("\n");
+		expect(outputWithUnknownUsage).toContain("?/200k");
+		expect(outputWithUnknownUsage).not.toContain("0.0%/200k");
 	});
 });
