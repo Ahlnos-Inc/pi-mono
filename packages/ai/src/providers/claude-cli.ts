@@ -21,18 +21,18 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * own native auth from ~/.claude/. This provider lets pi-ai treat that subprocess as an
  * ordinary stream-able provider.
  *
- * Tool access: we pass `--tools default --permission-mode bypassPermissions` so that the
- * subprocess has the same built-in toolset (Bash, Read, Edit, Write, Agent, …) as an
- * interactive Claude Code session. `bypassPermissions` prevents interactive prompts that
- * would hang an unattended subprocess. Key directories (Vault, ~/.pi, workspace) are added
- * via `--add-dir` so the subprocess can read/write them without cwd assumptions.
+ * Tool access: enabled, but scoped. Claude gets its core Code tools, while user-level
+ * plugins, hooks, and MCP servers are disabled by default to avoid injecting unrelated
+ * personal context (Gmail/Drive/superpowers/etc.) into every Pi provider call. Set
+ * PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT=1 to restore the full user Claude Code environment.
  *
  * Streaming: claude is invoked with `--output-format stream-json`, which emits JSONL records
  * for model deltas, tool calls, tool results, lifecycle status, and the final result. Pi still
  * treats claude-cli as one provider call: Claude's internal tool calls are surfaced as compact
  * activity text only, never as Pi ToolCall blocks, so Pi does not re-execute them.
  *
- * System prompt is passed via `claude -p --append-system-prompt` when present.
+ * System prompt is passed via `claude -p --system-prompt` when present so Pi's prompt
+ * replaces Claude Code's default agent prompt instead of stacking on top of it.
  */
 
 /**
@@ -57,6 +57,10 @@ function resolveIdleTimeoutMs(timeoutMs?: number): number {
 
 function resolveMaxRuntimeMs(): number | undefined {
 	return positiveEnvInt("PI_CLAUDE_CLI_MAX_RUNTIME_MS");
+}
+
+function includeUserClaudeContext(): boolean {
+	return /^(1|true|yes|on)$/i.test(process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT ?? "");
 }
 
 function extractPrompt(context: Context): string {
@@ -174,6 +178,13 @@ function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: s
 		"--include-partial-messages",
 		"--model",
 		model.id,
+	];
+
+	if (!includeUserClaudeContext()) {
+		args.push("--setting-sources", "local", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
+	}
+
+	args.push(
 		"--tools",
 		"default",
 		"--permission-mode",
@@ -184,9 +195,10 @@ function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: s
 		`${home}/.pi`,
 		"--add-dir",
 		`${home}/projects/ahlnos`,
-	];
+	);
+
 	const systemPrompt = context.systemPrompt;
-	if (systemPrompt?.trim()) args.push("--append-system-prompt", systemPrompt);
+	if (systemPrompt?.trim()) args.push("--system-prompt", systemPrompt);
 	args.push(prompt);
 	return args;
 }

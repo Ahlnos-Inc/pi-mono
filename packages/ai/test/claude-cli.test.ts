@@ -49,11 +49,12 @@ function writeJsonl(child: MockChildProcess, events: unknown[]): void {
 describe("claude-cli provider", () => {
 	beforeEach(() => {
 		vi.useRealTimers();
+		delete process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT;
 		spawnMock.mockReset();
 		spawnMock.mockReturnValue(new MockChildProcess());
 	});
 
-	it("spawns claude without a system prompt flag when context has no system prompt", () => {
+	it("spawns claude with core tools and scoped settings by default", () => {
 		streamClaudeCli(model, context(), {});
 
 		expect(spawnMock).toHaveBeenCalledWith(
@@ -66,6 +67,16 @@ describe("claude-cli provider", () => {
 				"--include-partial-messages",
 				"--model",
 				model.id,
+				"--setting-sources",
+				"local",
+				"--strict-mcp-config",
+				"--mcp-config",
+				'{"mcpServers":{}}',
+				"--tools",
+				"default",
+				"--permission-mode",
+				"bypassPermissions",
+				"--add-dir",
 				"hello",
 			]),
 			{
@@ -77,18 +88,30 @@ describe("claude-cli provider", () => {
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
 	});
 
-	it("passes a non-empty system prompt via --append-system-prompt", () => {
-		streamClaudeCli(model, context(" route instructions\n"), {});
+	it("can restore the full user Claude Code environment explicitly", () => {
+		process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT = "1";
 
+		streamClaudeCli(model, context(), {});
+
+		expect(spawnMock.mock.calls[0][1]).not.toContain("--setting-sources");
+		expect(spawnMock.mock.calls[0][1]).not.toContain("--strict-mcp-config");
 		expect(spawnMock.mock.calls[0][1]).toEqual(
-			expect.arrayContaining(["--append-system-prompt", " route instructions\n", "hello"]),
+			expect.arrayContaining(["--tools", "default", "--permission-mode", "bypassPermissions", "--add-dir"]),
 		);
 	});
 
-	it("skips --append-system-prompt for whitespace-only system prompts", () => {
+	it("passes a non-empty system prompt via --system-prompt", () => {
+		streamClaudeCli(model, context(" route instructions\n"), {});
+
+		expect(spawnMock.mock.calls[0][1]).toEqual(
+			expect.arrayContaining(["--system-prompt", " route instructions\n", "hello"]),
+		);
+	});
+
+	it("skips --system-prompt for whitespace-only system prompts", () => {
 		streamClaudeCli(model, context(" \n\t "), {});
 
-		expect(spawnMock.mock.calls[0][1]).not.toContain("--append-system-prompt");
+		expect(spawnMock.mock.calls[0][1]).not.toContain("--system-prompt");
 		expect(spawnMock.mock.calls[0][1]).toContain("hello");
 	});
 
@@ -97,9 +120,7 @@ describe("claude-cli provider", () => {
 
 		streamClaudeCli(model, context(systemPrompt), {});
 
-		expect(spawnMock.mock.calls[0][1]).toEqual(
-			expect.arrayContaining(["--append-system-prompt", systemPrompt, "hello"]),
-		);
+		expect(spawnMock.mock.calls[0][1]).toEqual(expect.arrayContaining(["--system-prompt", systemPrompt, "hello"]));
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
 	});
 
