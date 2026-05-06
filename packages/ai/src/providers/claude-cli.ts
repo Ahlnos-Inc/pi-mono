@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import type {
 	AssistantMessage,
 	Context,
@@ -44,6 +45,18 @@ const MAX_PRIOR_TURNS = 10;
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const KILL_GRACE_MS = 5_000;
 
+type StickyClaudeSession = {
+	sessionId: string;
+	turns: number;
+	seenMessageCount: number;
+};
+
+const stickySessions = new Map<string, StickyClaudeSession>();
+
+export function _clearClaudeCliStickySessionsForTest(): void {
+	stickySessions.clear();
+}
+
 function positiveEnvInt(name: string): number | undefined {
 	const value = Number.parseInt(process.env[name] ?? "", 10);
 	return Number.isFinite(value) && value > 0 ? value : undefined;
@@ -63,7 +76,72 @@ function includeUserClaudeContext(): boolean {
 	return /^(1|true|yes|on)$/i.test(process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT ?? "");
 }
 
-function extractPrompt(context: Context): string {
+function stickyClaudeSessionsEnabled(): boolean {
+	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_STICKY_SESSIONS ?? "");
+}
+
+function digestText(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
+function uuidFromKey(key: string): string {
+	const hex = digestText(key).slice(0, 32).split("");
+	hex[12] = "4";
+	hex[16] = ((Number.parseInt(hex[16] ?? "0", 16) & 0x3) | 0x8).toString(16);
+	return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20, 32).join("")}`;
+}
+
+function stickySessionKey(model: Model<"claude-cli">, context: Context): string {
+	const sessionKey = `${process.pid}:${process.env.PI_SESSION_ID ?? ""}`;
+	const systemPromptHash = digestText(context.systemPrompt ?? "");
+	return [process.cwd(), sessionKey, model.id, systemPromptHash].join("\n");
+}
+
+function getStickySession(model: Model<"claude-cli">, context: Context): StickyClaudeSession | undefined {
+	if (!stickyClaudeSessionsEnabled()) return undefined;
+	const key = stickySessionKey(model, context);
+	const existing = stickySessions.get(key);
+	if (existing) return existing;
+	const session = { sessionId: uuidFromKey(`pi-claude-cli\n${key}`), turns: 0, seenMessageCount: 0 };
+	stickySessions.set(key, session);
+	return session;
+}
+
+function latestUserIndex(context: Context): number {
+	for (let i = context.messages.length - 1; i >= 0; i--) {
+		if (context.messages[i].role === "user") return i;
+	}
+	return -1;
+}
+
+function collectPriorTurns(
+	context: Context,
+	latestUserIdx: number,
+	startIndex: number,
+): { label: "USER" | "ASSISTANT"; text: string }[] {
+	const priorTurns: { label: "USER" | "ASSISTANT"; text: string }[] = [];
+	for (let i = Math.max(0, startIndex); i < latestUserIdx; i++) {
+		const msg = context.messages[i];
+		if (msg.role !== "user" && msg.role !== "assistant") continue;
+		const text = messageToText(msg).trim();
+		if (!text) continue;
+		priorTurns.push({ label: msg.role === "user" ? "USER" : "ASSISTANT", text });
+	}
+	return priorTurns;
+}
+
+function renderPromptWithContext(
+	latestText: string,
+	priorTurns: { label: "USER" | "ASSISTANT"; text: string }[],
+	label: string,
+): string {
+	const trimmed = priorTurns.slice(-MAX_PRIOR_TURNS);
+	if (trimmed.length === 0) return latestText;
+	const contextBlock = trimmed.map((t) => `[${t.label}]\n${t.text}`).join("\n\n");
+	return `${label}:\n\n${contextBlock}\n\n---\n\nCurrent question:\n${latestText}`;
+}
+
+function extractPrompt(context: Context, stickySession?: StickyClaudeSession): string {
 	// Anthropic's third-party-app gate returns 400 if the API request *structure* sent
 	// to upstream by claude -p has a foreign system prompt or role-tagged multi-turn
 	// messages array. The gate is shape-based, not content-based — verified
@@ -80,37 +158,28 @@ function extractPrompt(context: Context): string {
 	// - toolResult messages (noisy + reveal Pi's tool framework, risk re-triggering gate)
 	// - turns beyond MAX_PRIOR_TURNS (latency/cost guard)
 
-	let latestUserIdx = -1;
-	for (let i = context.messages.length - 1; i >= 0; i--) {
-		if (context.messages[i].role === "user") {
-			latestUserIdx = i;
-			break;
-		}
-	}
+	const latestUserIdx = latestUserIndex(context);
 	if (latestUserIdx === -1) return "";
 
 	const latestText = messageToText(context.messages[latestUserIdx]);
 	if (!latestText) return "";
 
-	// Collect prior user/assistant turns (skip tool results), most recent last
-	const priorTurns: { label: "USER" | "ASSISTANT"; text: string }[] = [];
-	for (let i = 0; i < latestUserIdx; i++) {
-		const msg = context.messages[i];
-		if (msg.role !== "user" && msg.role !== "assistant") continue;
-		const text = messageToText(msg).trim();
-		if (!text) continue;
-		priorTurns.push({ label: msg.role === "user" ? "USER" : "ASSISTANT", text });
+	if (!stickySession || stickySession.turns === 0) {
+		return renderPromptWithContext(
+			latestText,
+			collectPriorTurns(context, latestUserIdx, 0),
+			"Prior conversation context (most recent last) — use as background for the question that follows",
+		);
 	}
 
-	// Truncate to most recent MAX_PRIOR_TURNS
-	const trimmed = priorTurns.slice(-MAX_PRIOR_TURNS);
-
-	if (trimmed.length === 0) {
-		return latestText;
-	}
-
-	const contextBlock = trimmed.map((t) => `[${t.label}]\n${t.text}`).join("\n\n");
-	return `Prior conversation context (most recent last) — use as background for the question that follows:\n\n${contextBlock}\n\n---\n\nCurrent question:\n${latestText}`;
+	const transcriptWasCompacted = latestUserIdx < stickySession.seenMessageCount - 1;
+	const unseenStart = transcriptWasCompacted ? 0 : Math.min(stickySession.seenMessageCount, latestUserIdx);
+	const unseenPriorTurns = collectPriorTurns(context, latestUserIdx, unseenStart);
+	return renderPromptWithContext(
+		latestText,
+		unseenPriorTurns,
+		"Intervening Pi conversation since your last Claude turn (most recent last) — use as background for the question that follows",
+	);
 }
 
 function messageToText(message: Message): string {
@@ -168,7 +237,12 @@ function buildAssistantMessage(
 	};
 }
 
-function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: string): string[] {
+function buildClaudeArgs(
+	model: Model<"claude-cli">,
+	context: Context,
+	prompt: string,
+	stickySession?: StickyClaudeSession,
+): string[] {
 	const home = process.env.HOME ?? "/root";
 	const args = [
 		"-p",
@@ -179,6 +253,8 @@ function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: s
 		"--model",
 		model.id,
 	];
+
+	if (stickySession) args.push("--session-id", stickySession.sessionId);
 
 	if (!includeUserClaudeContext()) {
 		args.push("--setting-sources", "local", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
@@ -197,7 +273,7 @@ function buildClaudeArgs(model: Model<"claude-cli">, context: Context, prompt: s
 		`${home}/projects/ahlnos`,
 	);
 
-	const systemPrompt = context.systemPrompt;
+	const systemPrompt = !stickySession || stickySession.turns === 0 ? context.systemPrompt : undefined;
 	if (systemPrompt?.trim()) args.push("--system-prompt", systemPrompt);
 	args.push(prompt);
 	return args;
@@ -274,7 +350,9 @@ function runClaudeCli(
 	options?: { signal?: AbortSignal; timeoutMs?: number },
 ) {
 	const stream = createAssistantMessageEventStream();
-	const prompt = extractPrompt(context);
+	const stickySession = getStickySession(model, context);
+	const prompt = extractPrompt(context, stickySession);
+	const nextSeenMessageCount = latestUserIndex(context) + 2;
 	const idleTimeoutMs = resolveIdleTimeoutMs(options?.timeoutMs);
 	const maxRuntimeMs = resolveMaxRuntimeMs();
 
@@ -286,7 +364,7 @@ function runClaudeCli(
 	const home = process.env.HOME ?? "/root";
 	let child: ReturnType<typeof spawn>;
 	try {
-		child = spawn("claude", buildClaudeArgs(model, context, prompt), {
+		child = spawn("claude", buildClaudeArgs(model, context, prompt, stickySession), {
 			env: childEnv,
 			cwd: `${home}/projects/ahlnos`,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -503,6 +581,10 @@ function runClaudeCli(
 		if (event.type === "result") {
 			if (typeof event.result === "string") finalText = event.result;
 			finalUsage = usageFromClaudeResult(event);
+			if (stickySession) {
+				stickySession.turns += 1;
+				stickySession.seenMessageCount = nextSeenMessageCount;
+			}
 		}
 	};
 

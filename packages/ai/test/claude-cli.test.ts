@@ -1,8 +1,8 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { streamClaudeCli } from "../src/providers/claude-cli.js";
-import type { AssistantMessageEvent, Context, Model } from "../src/types.js";
+import { _clearClaudeCliStickySessionsForTest, streamClaudeCli } from "../src/providers/claude-cli.js";
+import type { AssistantMessageEvent, Context, Message, Model } from "../src/types.js";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
@@ -36,6 +36,10 @@ function context(systemPrompt?: string): Context {
 	};
 }
 
+function contextWithMessages(messages: Message[], systemPrompt?: string): Context {
+	return { systemPrompt, messages };
+}
+
 async function collectEvents(stream: AsyncIterable<AssistantMessageEvent>): Promise<AssistantMessageEvent[]> {
 	const events: AssistantMessageEvent[] = [];
 	for await (const event of stream) events.push(event);
@@ -50,6 +54,8 @@ describe("claude-cli provider", () => {
 	beforeEach(() => {
 		vi.useRealTimers();
 		delete process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT;
+		delete process.env.PI_CLAUDE_CLI_STICKY_SESSIONS;
+		_clearClaudeCliStickySessionsForTest();
 		spawnMock.mockReset();
 		spawnMock.mockReturnValue(new MockChildProcess());
 	});
@@ -122,6 +128,123 @@ describe("claude-cli provider", () => {
 
 		expect(spawnMock.mock.calls[0][1]).toEqual(expect.arrayContaining(["--system-prompt", systemPrompt, "hello"]));
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
+	});
+
+	it("uses a sticky Claude session id across calls with the same system prompt", () => {
+		streamClaudeCli(model, context("same system"), {});
+		streamClaudeCli(model, context("same system"), {});
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+		const secondSession = secondArgs[secondArgs.indexOf("--session-id") + 1];
+
+		expect(firstSession).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		expect(secondSession).toBe(firstSession);
+	});
+
+	it("only sends inline prior Pi turns on the first sticky Claude call", () => {
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(child).mockReturnValueOnce(new MockChildProcess());
+		const firstMessages: Message[] = [{ role: "user", content: "first question", timestamp: 1 }];
+
+		streamClaudeCli(model, contextWithMessages(firstMessages, "same system"), {});
+		writeJsonl(child, [{ type: "result", subtype: "success", result: "ok", usage: {} }]);
+		const secondMessages: Message[] = [
+			{ role: "user", content: "first question", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "first answer" }], timestamp: 2 } as Message,
+			{ role: "user", content: "follow-up", timestamp: 3 },
+		];
+		streamClaudeCli(model, contextWithMessages(secondMessages, "same system"), {});
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		expect(firstArgs).toEqual(expect.arrayContaining(["--system-prompt", "same system"]));
+		expect(firstArgs.at(-1)).toBe("first question");
+		expect(secondArgs).not.toContain("--system-prompt");
+		expect(secondArgs.at(-1)).toBe("follow-up");
+	});
+
+	it("catches up intervening non-Claude turns when returning to a sticky Claude session", () => {
+		const firstChild = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
+
+		streamClaudeCli(
+			model,
+			contextWithMessages([{ role: "user", content: "planning question", timestamp: 1 }], "same system"),
+			{},
+		);
+		writeJsonl(firstChild, [{ type: "result", subtype: "success", result: "plan", usage: {} }]);
+
+		const messages: Message[] = [
+			{ role: "user", content: "planning question", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "plan" }], timestamp: 2 } as Message,
+			{ role: "user", content: "codex did implementation", timestamp: 3 },
+			{ role: "assistant", content: [{ type: "text", text: "implementation complete" }], timestamp: 4 } as Message,
+			{ role: "user", content: "review the result", timestamp: 5 },
+		];
+
+		streamClaudeCli(model, contextWithMessages(messages, "same system"), {});
+
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		expect(secondArgs.at(-1)).toContain("Intervening Pi conversation since your last Claude turn");
+		expect(secondArgs.at(-1)).not.toContain("planning question");
+		expect(secondArgs.at(-1)).toContain("codex did implementation");
+		expect(secondArgs.at(-1)).toContain("implementation complete");
+		expect(secondArgs.at(-1)).toContain("review the result");
+	});
+
+	it("sends compacted prior context when the Pi transcript shrinks", () => {
+		const firstChild = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
+		const firstMessages: Message[] = [
+			{ role: "user", content: "one", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "two" }], timestamp: 2 } as Message,
+			{ role: "user", content: "three", timestamp: 3 },
+			{ role: "assistant", content: [{ type: "text", text: "four" }], timestamp: 4 } as Message,
+			{ role: "user", content: "five", timestamp: 5 },
+		];
+
+		streamClaudeCli(model, contextWithMessages(firstMessages, "same system"), {});
+		writeJsonl(firstChild, [{ type: "result", subtype: "success", result: "six", usage: {} }]);
+
+		const compactedMessages: Message[] = [
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Compacted summary of intervening work" }],
+				timestamp: 6,
+			} as Message,
+			{ role: "user", content: "continue from the summary", timestamp: 7 },
+		];
+		streamClaudeCli(model, contextWithMessages(compactedMessages, "same system"), {});
+
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		expect(secondArgs.at(-1)).toContain("Compacted summary of intervening work");
+		expect(secondArgs.at(-1)).toContain("continue from the summary");
+	});
+
+	it("does not reuse sticky Claude sessions across Pi process starts", () => {
+		const originalPid = Object.getOwnPropertyDescriptor(process, "pid");
+		Object.defineProperty(process, "pid", { configurable: true, value: 111 });
+		streamClaudeCli(model, context("same system"), {});
+		Object.defineProperty(process, "pid", { configurable: true, value: 222 });
+		streamClaudeCli(model, context("same system"), {});
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+		const secondSession = secondArgs[secondArgs.indexOf("--session-id") + 1];
+
+		expect(secondSession).not.toBe(firstSession);
+		if (originalPid) Object.defineProperty(process, "pid", originalPid);
+	});
+
+	it("can disable sticky Claude sessions with PI_CLAUDE_CLI_STICKY_SESSIONS=0", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "0";
+
+		streamClaudeCli(model, context(), {});
+
+		expect(spawnMock.mock.calls[0][1]).not.toContain("--session-id");
 	});
 
 	it("terminates a silent claude subprocess when idle timeoutMs elapses", () => {
