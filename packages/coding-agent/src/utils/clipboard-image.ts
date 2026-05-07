@@ -276,7 +276,7 @@ export async function readClipboardImage(options?: {
 			image = readClipboardImageViaPowerShell();
 		}
 
-		if (!image && !wayland) {
+		if (!image) {
 			image = await readClipboardImageViaNativeClipboard();
 		}
 	} else {

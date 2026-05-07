@@ -108,6 +108,26 @@ describe("readClipboardImage", () => {
 		expect(Array.from(result?.bytes ?? [])).toEqual([9, 8]);
 	});
 
+	test("Wayland: falls back to native clipboard when external clipboard tools are missing", async () => {
+		const enoent = new Error("spawn ENOENT");
+		(enoent as { code?: string }).code = "ENOENT";
+
+		mocks.spawnSync.mockImplementation((command, _args, _options) => {
+			if (command === "wl-paste" || command === "xclip") {
+				return spawnError(enoent);
+			}
+			throw new Error(`Unexpected spawnSync call: ${command}`);
+		});
+		mocks.clipboard.hasImage.mockReturnValue(true);
+		mocks.clipboard.getImageBinary.mockResolvedValue(new Uint8Array([5, 4, 3]));
+
+		const { readClipboardImage } = await import("../src/utils/clipboard-image.js");
+		const result = await readClipboardImage({ platform: "linux", env: { WAYLAND_DISPLAY: "1" } });
+		expect(result).not.toBeNull();
+		expect(result?.mimeType).toBe("image/png");
+		expect(Array.from(result?.bytes ?? [])).toEqual([5, 4, 3]);
+	});
+
 	test("WSL: passes PowerShell path directly instead of through a custom env var", async () => {
 		mocks.clipboard.hasImage.mockImplementation(() => {
 			throw new Error("clipboard.hasImage should not be called before PowerShell on WSL");

@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import * as path from "node:path";
+import type { ImageContent } from "@mariozechner/pi-ai";
 import { type AutocompleteProvider, CombinedAutocompleteProvider, Container } from "@mariozechner/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
@@ -97,6 +98,69 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(header.setExpanded).toHaveBeenCalledWith(true);
 		expect(chatChild.setExpanded).toHaveBeenCalledWith(true);
 		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("InteractiveMode clipboard image attachments", () => {
+	const png: ImageContent = {
+		type: "image",
+		mimeType: "image/png",
+		data: "iVBORw0KGgo=",
+	};
+	const jpeg: ImageContent = {
+		type: "image",
+		mimeType: "image/jpeg",
+		data: "/9j/4AAQSkZJRg==",
+	};
+
+	test("strips image markers and returns matching attachments", () => {
+		const fakeThis: any = {
+			clipboardImages: new Map<number, ImageContent>([
+				[1, png],
+				[2, jpeg],
+			]),
+		};
+
+		const result = (InteractiveMode as any).prototype.collectClipboardImagesForText.call(
+			fakeThis,
+			"compare [image #1] and [image #2] please",
+			{ consume: true },
+		);
+
+		expect(result).toEqual({
+			text: "compare and please",
+			images: [png, jpeg],
+		});
+		expect(fakeThis.clipboardImages.has(1)).toBe(false);
+		expect(fakeThis.clipboardImages.has(2)).toBe(false);
+	});
+
+	test("uses fallback text when the prompt only contains image markers", () => {
+		const fakeThis: any = {
+			clipboardImages: new Map<number, ImageContent>([[1, png]]),
+		};
+
+		const result = (InteractiveMode as any).prototype.collectClipboardImagesForText.call(fakeThis, "[image #1]", {
+			consume: true,
+		});
+
+		expect(result).toEqual({
+			text: "Please analyze the attached image.",
+			images: [png],
+		});
+	});
+
+	test("drops images whose marker was removed before submit", () => {
+		const fakeThis: any = {
+			clipboardImages: new Map<number, ImageContent>([[1, png]]),
+		};
+
+		const result = (InteractiveMode as any).prototype.collectClipboardImagesForText.call(fakeThis, "plain prompt", {
+			consume: true,
+		});
+
+		expect(result).toEqual({ text: "plain prompt" });
+		expect(fakeThis.clipboardImages.has(1)).toBe(false);
 	});
 });
 

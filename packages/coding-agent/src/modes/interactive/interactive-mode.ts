@@ -3,7 +3,6 @@
  * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
  */
 
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -82,8 +81,9 @@ import { isInstallTelemetryEnabled } from "../../core/telemetry.js";
 import type { TruncationResult } from "../../core/tools/truncate.js";
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
-import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
+import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
+import { resizeImage } from "../../utils/image-resize.js";
 import { getPiUserAgent } from "../../utils/pi-user-agent.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool } from "../../utils/tools-manager.js";
@@ -161,7 +161,15 @@ class ExpandableText extends Text implements Expandable {
 type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	images?: ImageContent[];
 };
+
+type SubmittedInput = {
+	text: string;
+	images?: ImageContent[];
+};
+
+const CLIPBOARD_IMAGE_MARKER_REGEX = /\[image #(\d+)\]/g;
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
@@ -243,7 +251,7 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string) => void;
+	private onInputCallback?: (input: SubmittedInput) => void;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
@@ -302,6 +310,10 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+
+	// Clipboard images attached to editor markers like [image #1].
+	private clipboardImageCounter = 0;
+	private clipboardImages = new Map<number, ImageContent>();
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -755,7 +767,7 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				await this.session.prompt(userInput.text, { images: userInput.images });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -2416,24 +2428,90 @@ export class InteractiveMode {
 
 	private async handleClipboardImagePaste(): Promise<void> {
 		try {
-			const image = await readClipboardImage();
-			if (!image) {
+			if (this.settingsManager.getBlockImages()) {
+				this.showWarning("Image input is disabled in settings.");
 				return;
 			}
 
-			// Write to temp file
-			const tmpDir = os.tmpdir();
-			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-			const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
-			const filePath = path.join(tmpDir, fileName);
-			fs.writeFileSync(filePath, Buffer.from(image.bytes));
+			const image = await readClipboardImage();
+			if (!image) {
+				this.showStatus("No image found on clipboard");
+				return;
+			}
 
-			// Insert file path directly
-			this.editor.insertTextAtCursor?.(filePath);
+			let attachment: ImageContent = {
+				type: "image",
+				mimeType: image.mimeType,
+				data: Buffer.from(image.bytes).toString("base64"),
+			};
+
+			if (this.settingsManager.getImageAutoResize()) {
+				const resized = await resizeImage(attachment);
+				if (!resized) {
+					this.showWarning("Clipboard image could not be resized for model input.");
+					return;
+				}
+				attachment = {
+					type: "image",
+					mimeType: resized.mimeType,
+					data: resized.data,
+				};
+			}
+
+			const id = ++this.clipboardImageCounter;
+			this.clipboardImages.set(id, attachment);
+			this.insertClipboardImageMarker(id);
+			this.showStatus(`Attached clipboard image #${id}`);
 			this.ui.requestRender();
-		} catch {
-			// Silently ignore clipboard errors (may not have permission, etc.)
+		} catch (error) {
+			this.showWarning(`Could not paste clipboard image: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	private insertClipboardImageMarker(id: number): void {
+		const currentText = this.editor.getText();
+		const prefix = currentText.length > 0 && !/\s$/.test(currentText) ? " " : "";
+		this.editor.insertTextAtCursor?.(`${prefix}[image #${id}] `);
+	}
+
+	private collectClipboardImagesForText(
+		text: string,
+		options?: { consume?: boolean },
+	): { text: string; images?: ImageContent[] } {
+		const ids: number[] = [];
+		const strippedText = text
+			.replace(CLIPBOARD_IMAGE_MARKER_REGEX, (_marker, idText: string) => {
+				const id = Number(idText);
+				if (Number.isInteger(id)) ids.push(id);
+				return " ";
+			})
+			.replace(/[ \t]{2,}/g, " ")
+			.trim();
+
+		const images: ImageContent[] = [];
+		const referencedIds = new Set(ids);
+		for (const id of ids) {
+			const image = this.clipboardImages.get(id);
+			if (!image) continue;
+			images.push(image);
+			if (options?.consume) this.clipboardImages.delete(id);
+		}
+		if (options?.consume) {
+			for (const id of this.clipboardImages.keys()) {
+				if (!referencedIds.has(id)) this.clipboardImages.delete(id);
+			}
+		}
+
+		if (images.length === 0) {
+			return { text };
+		}
+
+		return {
+			text:
+				strippedText ||
+				(images.length === 1 ? "Please analyze the attached image." : "Please analyze the attached images."),
+			images,
+		};
 	}
 
 	private setupEditorSubmitHandler(): void {
@@ -2590,7 +2668,8 @@ export class InteractiveMode {
 					this.editor.setText("");
 					await this.session.prompt(text);
 				} else {
-					this.queueCompactionMessage(text, "steer");
+					const input = this.collectClipboardImagesForText(text, { consume: true });
+					this.queueCompactionMessage(input.text, "steer", input.images);
 				}
 				return;
 			}
@@ -2598,9 +2677,10 @@ export class InteractiveMode {
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.session.isStreaming) {
-				this.editor.addToHistory?.(text);
+				const input = this.collectClipboardImagesForText(text, { consume: true });
+				this.editor.addToHistory?.(input.text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.session.prompt(input.text, { streamingBehavior: "steer", images: input.images });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -2611,7 +2691,10 @@ export class InteractiveMode {
 			this.flushPendingBashComponents();
 
 			if (this.onInputCallback) {
-				this.onInputCallback(text);
+				const input = this.collectClipboardImagesForText(text, { consume: true });
+				this.onInputCallback(input);
+				this.editor.addToHistory?.(input.text);
+				return;
 			}
 			this.editor.addToHistory?.(text);
 		};
@@ -3178,11 +3261,11 @@ export class InteractiveMode {
 		}
 	}
 
-	async getUserInput(): Promise<string> {
+	async getUserInput(): Promise<SubmittedInput> {
 		return new Promise((resolve) => {
-			this.onInputCallback = (text: string) => {
+			this.onInputCallback = (input: SubmittedInput) => {
 				this.onInputCallback = undefined;
-				resolve(text);
+				resolve(input);
 			};
 		});
 	}
@@ -3337,7 +3420,8 @@ export class InteractiveMode {
 				this.editor.setText("");
 				await this.session.prompt(text);
 			} else {
-				this.queueCompactionMessage(text, "followUp");
+				const input = this.collectClipboardImagesForText(text, { consume: true });
+				this.queueCompactionMessage(input.text, "followUp", input.images);
 			}
 			return;
 		}
@@ -3345,9 +3429,10 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
-			this.editor.addToHistory?.(text);
+			const input = this.collectClipboardImagesForText(text, { consume: true });
+			this.editor.addToHistory?.(input.text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.session.prompt(input.text, { streamingBehavior: "followUp", images: input.images });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
@@ -3628,8 +3713,8 @@ export class InteractiveMode {
 		return allQueued.length;
 	}
 
-	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
+	private queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void {
+		this.compactionQueuedMessages.push({ text, mode, images });
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
@@ -3702,7 +3787,7 @@ export class InteractiveMode {
 			}
 
 			// Send first prompt (starts streaming)
-			const promptPromise = this.session.prompt(firstPrompt.text).catch((error) => {
+			const promptPromise = this.session.prompt(firstPrompt.text, { images: firstPrompt.images }).catch((error) => {
 				restoreQueue(error);
 			});
 
@@ -3711,9 +3796,9 @@ export class InteractiveMode {
 				if (this.isExtensionCommand(message.text)) {
 					await this.session.prompt(message.text);
 				} else if (message.mode === "followUp") {
-					await this.session.followUp(message.text);
+					await this.session.followUp(message.text, message.images);
 				} else {
-					await this.session.steer(message.text);
+					await this.session.steer(message.text, message.images);
 				}
 			}
 			this.updatePendingMessagesDisplay();
