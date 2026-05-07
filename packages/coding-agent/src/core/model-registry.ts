@@ -389,6 +389,23 @@ export class ModelRegistry {
 			// Keep built-in models even if custom models failed to load
 		}
 
+		// Ahlnos local: OLLAMA_BASE_URL env wins over tracked models.json so per-machine
+		// hosts (e.g. Tailscale vs. localhost) can be selected without editing shared config.
+		// Ollama-only by design; other providers must not be redirected via this env.
+		const ollamaEnvBase = process.env.OLLAMA_BASE_URL;
+		if (ollamaEnvBase && ollamaEnvBase.length > 0) {
+			const existing = overrides.get("ollama") ?? {};
+			overrides.set("ollama", { ...existing, baseUrl: ollamaEnvBase });
+
+			// Rewrite per-model baseUrl on any custom ollama models loaded from models.json,
+			// since loadCustomModels() bakes baseUrl into each Model<Api> at parse time.
+			for (let i = 0; i < customModels.length; i++) {
+				if (customModels[i].provider === "ollama") {
+					customModels[i] = { ...customModels[i], baseUrl: ollamaEnvBase };
+				}
+			}
+		}
+
 		const builtInModels = this.loadBuiltInModels(overrides, modelOverrides);
 		let combined = this.mergeCustomModels(builtInModels, customModels);
 
