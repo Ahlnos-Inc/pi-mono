@@ -14,6 +14,7 @@ import {
 	type Message,
 	type Model,
 	type OAuthProviderId,
+	type OAuthSelectPrompt,
 } from "@mariozechner/pi-ai";
 import type {
 	AutocompleteItem,
@@ -2715,6 +2716,7 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.pendingTools.clear();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -3182,6 +3184,7 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		this.pendingTools.clear();
+		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 
 		if (options.updateFooter) {
 			this.footer.invalidate();
@@ -3223,16 +3226,16 @@ export class InteractiveMode {
 							}
 							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
 						} else {
-							this.pendingTools.set(content.id, component);
+							renderedPendingTools.set(content.id, component);
 						}
 					}
 				}
 			} else if (message.role === "toolResult") {
 				// Match tool results to pending tool components
-				const component = this.pendingTools.get(message.toolCallId);
+				const component = renderedPendingTools.get(message.toolCallId);
 				if (component) {
 					component.updateResult(message);
-					this.pendingTools.delete(message.toolCallId);
+					renderedPendingTools.delete(message.toolCallId);
 				}
 			} else {
 				// All other messages use standard rendering
@@ -3240,7 +3243,9 @@ export class InteractiveMode {
 			}
 		}
 
-		this.pendingTools.clear();
+		for (const [toolCallId, component] of renderedPendingTools) {
+			this.pendingTools.set(toolCallId, component);
+		}
 		this.ui.requestRender();
 	}
 
@@ -4730,6 +4735,34 @@ export class InteractiveMode {
 		}
 	}
 
+	private showOAuthLoginSelect(dialog: LoginDialogComponent, prompt: OAuthSelectPrompt): Promise<string | undefined> {
+		return new Promise((resolve) => {
+			const restoreDialog = () => {
+				this.editorContainer.clear();
+				this.editorContainer.addChild(dialog);
+				this.ui.setFocus(dialog);
+				this.ui.requestRender();
+			};
+			const labels = prompt.options.map((option) => option.label);
+			const selector = new ExtensionSelectorComponent(
+				prompt.message,
+				labels,
+				(optionLabel) => {
+					restoreDialog();
+					resolve(prompt.options.find((option) => option.label === optionLabel)?.id);
+				},
+				() => {
+					restoreDialog();
+					resolve(undefined);
+				},
+			);
+			this.editorContainer.clear();
+			this.editorContainer.addChild(selector);
+			this.ui.setFocus(selector);
+			this.ui.requestRender();
+		});
+	}
+
 	private async showLoginDialog(providerId: string, providerName: string): Promise<void> {
 		const providerInfo = this.session.modelRegistry.authStorage
 			.getOAuthProviders()
@@ -4806,6 +4839,8 @@ export class InteractiveMode {
 				onProgress: (message: string) => {
 					dialog.showProgress(message);
 				},
+
+				onSelect: (prompt: OAuthSelectPrompt) => this.showOAuthLoginSelect(dialog, prompt),
 
 				onManualCodeInput: () => manualCodePromise,
 
