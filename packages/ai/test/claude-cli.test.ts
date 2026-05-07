@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { _clearClaudeCliStickySessionsForTest, streamClaudeCli } from "../src/providers/claude-cli.js";
@@ -11,6 +12,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 class MockChildProcess extends EventEmitter {
+	stdin = new PassThrough();
 	stdout = new PassThrough();
 	stderr = new PassThrough();
 	kill = vi.fn();
@@ -128,6 +130,37 @@ describe("claude-cli provider", () => {
 
 		expect(spawnMock.mock.calls[0][1]).toEqual(expect.arrayContaining(["--system-prompt", systemPrompt, "hello"]));
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
+	});
+
+	it("passes large prompts through stdin instead of argv to avoid E2BIG", () => {
+		const largePrompt = "x".repeat(70 * 1024);
+		const child = new MockChildProcess();
+		const stdinEnd = vi.spyOn(child.stdin, "end");
+		spawnMock.mockReturnValueOnce(child);
+
+		streamClaudeCli(model, contextWithMessages([{ role: "user", content: largePrompt, timestamp: 1 }]), {});
+
+		const args = spawnMock.mock.calls[0][1] as string[];
+		expect(args).not.toContain(largePrompt);
+		expect(spawnMock.mock.calls[0][2]).toMatchObject({ stdio: ["pipe", "pipe", "pipe"] });
+		expect(stdinEnd).toHaveBeenCalledWith(largePrompt);
+	});
+
+	it("passes large system prompts through a file instead of argv to avoid E2BIG", () => {
+		const largeSystemPrompt = "system\n" + "y".repeat(70 * 1024);
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(child);
+
+		streamClaudeCli(model, context(largeSystemPrompt), {});
+
+		const args = spawnMock.mock.calls[0][1] as string[];
+		const fileArgIndex = args.indexOf("--system-prompt-file");
+		expect(fileArgIndex).toBeGreaterThanOrEqual(0);
+		expect(args).not.toContain(largeSystemPrompt);
+		expect(readFileSync(args[fileArgIndex + 1], "utf8")).toBe(largeSystemPrompt);
+
+		child.emit("close", 0);
+		expect(existsSync(args[fileArgIndex + 1])).toBe(false);
 	});
 
 	it("uses a sticky Claude session id across calls with the same system prompt", () => {

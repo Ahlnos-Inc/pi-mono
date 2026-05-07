@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { registerSessionResourceCleanup } from "../session-resources.js";
 import type {
 	AssistantMessage,
@@ -45,6 +48,14 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
 const MAX_PRIOR_TURNS = 10;
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const KILL_GRACE_MS = 5_000;
+
+/**
+ * Keep dynamic Claude CLI argument values comfortably below platform ARG_MAX.
+ * Long compaction prompts can be hundreds of KB/MB; passing them as argv makes
+ * node spawn fail with E2BIG before Claude can read anything. Use stdin/files
+ * once values are no longer small command-line arguments.
+ */
+const MAX_CLAUDE_DYNAMIC_ARG_BYTES = 64 * 1024;
 
 type StickyClaudeSession = {
 	sessionId: string;
@@ -253,13 +264,41 @@ function buildAssistantMessage(
 	};
 }
 
-function buildClaudeArgs(
+function shouldExternalizeClaudeArg(value: string): boolean {
+	return Buffer.byteLength(value, "utf8") > MAX_CLAUDE_DYNAMIC_ARG_BYTES;
+}
+
+function writeClaudeArgTempFile(prefix: string, value: string): string {
+	const dir = mkdtempSync(join(tmpdir(), "pi-claude-cli-"));
+	const file = join(dir, prefix);
+	writeFileSync(file, value, { encoding: "utf8", mode: 0o600 });
+	return file;
+}
+
+function cleanupClaudeArgTempFiles(files: string[]): void {
+	for (const file of files) {
+		try {
+			rmSync(dirname(file), { recursive: true, force: true });
+		} catch {
+			/* noop */
+		}
+	}
+}
+
+type ClaudeInvocation = {
+	args: string[];
+	stdinPrompt?: string;
+	tempFiles: string[];
+};
+
+function buildClaudeInvocation(
 	model: Model<"claude-cli">,
 	context: Context,
 	prompt: string,
 	stickySession?: StickyClaudeSession,
-): string[] {
+): ClaudeInvocation {
 	const home = process.env.HOME ?? "/root";
+	const tempFiles: string[] = [];
 	const args = [
 		"-p",
 		"--verbose",
@@ -290,9 +329,24 @@ function buildClaudeArgs(
 	);
 
 	const systemPrompt = !stickySession || stickySession.turns === 0 ? context.systemPrompt : undefined;
-	if (systemPrompt?.trim()) args.push("--system-prompt", systemPrompt);
-	args.push(prompt);
-	return args;
+	if (systemPrompt?.trim()) {
+		if (shouldExternalizeClaudeArg(systemPrompt)) {
+			const systemPromptFile = writeClaudeArgTempFile("system-prompt.txt", systemPrompt);
+			tempFiles.push(systemPromptFile);
+			args.push("--system-prompt-file", systemPromptFile);
+		} else {
+			args.push("--system-prompt", systemPrompt);
+		}
+	}
+
+	let stdinPrompt: string | undefined;
+	if (shouldExternalizeClaudeArg(prompt)) {
+		stdinPrompt = prompt;
+	} else {
+		args.push(prompt);
+	}
+
+	return { args, stdinPrompt, tempFiles };
 }
 
 type ClaudeCliJson = Record<string, any>;
@@ -378,15 +432,20 @@ function runClaudeCli(
 	delete childEnv.ANTHROPIC_BASE_URL;
 
 	const home = process.env.HOME ?? "/root";
+	const invocation = buildClaudeInvocation(model, context, prompt, stickySession);
 	let child: ReturnType<typeof spawn>;
 	try {
-		child = spawn("claude", buildClaudeArgs(model, context, prompt, stickySession), {
+		child = spawn("claude", invocation.args, {
 			env: childEnv,
 			cwd: `${home}/projects/ahlnos`,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: [invocation.stdinPrompt === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		});
+		if (invocation.stdinPrompt !== undefined) {
+			child.stdin?.end(invocation.stdinPrompt);
+		}
 		activeChildren.add(child);
 	} catch (spawnErr) {
+		cleanupClaudeArgTempFiles(invocation.tempFiles);
 		const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
 		const errMessage = buildAssistantMessage(model, "", "error", `claude-cli spawn failed: ${msg}`);
 		stream.push({ type: "error", reason: "error", error: errMessage });
@@ -626,6 +685,7 @@ function runClaudeCli(
 	});
 
 	child.on("error", (err) => {
+		cleanupClaudeArgTempFiles(invocation.tempFiles);
 		cleanup();
 		const errMessage = buildAssistantMessage(
 			model,
@@ -640,6 +700,7 @@ function runClaudeCli(
 	});
 
 	child.on("close", (code) => {
+		cleanupClaudeArgTempFiles(invocation.tempFiles);
 		cleanup();
 		const trailing = parseJsonLine(lineBuffer);
 		if (trailing) handleClaudeEvent(trailing);
