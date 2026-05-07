@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import * as path from "node:path";
-import type { ImageContent } from "@mariozechner/pi-ai";
-import { type AutocompleteProvider, CombinedAutocompleteProvider, Container } from "@mariozechner/pi-tui";
+import type { ImageContent } from "@earendil-works/pi-ai";
+import { type AutocompleteProvider, CombinedAutocompleteProvider, Container } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import type { SourceInfo } from "../src/core/source-info.js";
