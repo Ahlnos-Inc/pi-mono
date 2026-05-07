@@ -201,6 +201,20 @@ const BEDROCK_PROVIDER_ID = "amazon-bedrock";
 
 const BUILT_IN_MODEL_PROVIDERS = new Set<string>(getProviders());
 
+function formatElapsed(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) {
+		return `${hours}h ${minutes.toString().padStart(2, "0")}m`;
+	}
+	if (minutes > 0) {
+		return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+	}
+	return `${seconds}s`;
+}
+
 export function isApiKeyLoginProvider(
 	providerId: string,
 	oauthProviderIds: ReadonlySet<string>,
@@ -255,9 +269,9 @@ export class InteractiveMode {
 	private onInputCallback?: (input: SubmittedInput) => void;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
+	private workingStartedAtMs: number | undefined = undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
-	private readonly defaultWorkingMessage = "Working...";
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
@@ -1671,8 +1685,16 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private getWorkingLoaderMessage(): string {
-		return this.workingMessage ?? this.defaultWorkingMessage;
+	private getDefaultWorkingLoaderMessage(): string {
+		const model = this.session.state.model;
+		const modelLabel = model ? `${model.provider}/${model.id}` : "model";
+		const startedAt = this.workingStartedAtMs;
+		const elapsed = startedAt ? ` · ${formatElapsed(Date.now() - startedAt)}` : "";
+		return `Generating with ${modelLabel}${elapsed} · ${keyText("app.interrupt")} to interrupt`;
+	}
+
+	private getWorkingLoaderMessage(): string | (() => string) {
+		return this.workingMessage ?? (() => this.getDefaultWorkingLoaderMessage());
 	}
 
 	private createWorkingLoader(): Loader {
@@ -1810,7 +1832,7 @@ export class InteractiveMode {
 		this.workingVisible = true;
 		this.setWorkingIndicator();
 		if (this.loadingAnimation) {
-			this.loadingAnimation.setMessage(`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`);
+			this.loadingAnimation.setMessage(this.getWorkingLoaderMessage());
 		}
 		this.setHiddenThinkingLabel();
 	}
@@ -1960,7 +1982,7 @@ export class InteractiveMode {
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
 				if (this.loadingAnimation) {
-					this.loadingAnimation.setMessage(message ?? this.defaultWorkingMessage);
+					this.loadingAnimation.setMessage(message ?? this.getWorkingLoaderMessage());
 				}
 			},
 			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
@@ -2717,6 +2739,7 @@ export class InteractiveMode {
 		switch (event.type) {
 			case "agent_start":
 				this.pendingTools.clear();
+				this.workingStartedAtMs = Date.now();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -2898,6 +2921,7 @@ export class InteractiveMode {
 			}
 
 			case "agent_end":
+				this.workingStartedAtMs = undefined;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}

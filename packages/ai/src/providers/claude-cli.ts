@@ -461,7 +461,6 @@ function runClaudeCli(
 	let responseModel: string | undefined;
 	let finalUsage: Usage | undefined;
 	let aborted = false;
-	let idleTimedOut = false;
 	let maxRuntimeTimedOut = false;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
 	let maxRuntimeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -495,8 +494,9 @@ function runClaudeCli(
 	const resetIdleTimer = () => {
 		if (idleTimer) clearTimeout(idleTimer);
 		idleTimer = setTimeout(() => {
-			idleTimedOut = true;
-			terminate();
+			const seconds = Math.ceil(idleTimeoutMs / 1000);
+			appendActivity(`no claude-cli output for ${seconds}s; still waiting`);
+			resetIdleTimer();
 		}, idleTimeoutMs);
 	};
 
@@ -719,14 +719,13 @@ function runClaudeCli(
 			return;
 		}
 
-		if (idleTimedOut || maxRuntimeTimedOut) {
-			const seconds = Math.ceil((idleTimedOut ? idleTimeoutMs : (maxRuntimeMs ?? idleTimeoutMs)) / 1000);
-			const timeoutType = idleTimedOut ? "idle" : "max runtime";
+		if (maxRuntimeTimedOut) {
+			const seconds = Math.ceil((maxRuntimeMs ?? idleTimeoutMs) / 1000);
 			const timedOutMessage = buildAssistantMessage(
 				model,
 				finalText || displayText,
 				"error",
-				`claude-cli ${timeoutType} timed out after ${seconds}s`,
+				`claude-cli max runtime timed out after ${seconds}s`,
 				finalUsage,
 				responseModel,
 			);

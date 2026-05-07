@@ -57,6 +57,7 @@ describe("claude-cli provider", () => {
 		vi.useRealTimers();
 		delete process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT;
 		delete process.env.PI_CLAUDE_CLI_STICKY_SESSIONS;
+		delete process.env.PI_CLAUDE_CLI_MAX_RUNTIME_MS;
 		_clearClaudeCliStickySessionsForTest();
 		spawnMock.mockReset();
 		spawnMock.mockReturnValue(new MockChildProcess());
@@ -288,19 +289,44 @@ describe("claude-cli provider", () => {
 		expect(spawnMock.mock.calls[0][1]).not.toContain("--session-id");
 	});
 
-	it("terminates a silent claude subprocess when idle timeoutMs elapses", () => {
+	it("reports silent claude subprocess idle intervals without terminating it", async () => {
 		vi.useFakeTimers();
 		const child = new MockChildProcess();
 		spawnMock.mockReturnValue(child);
 
-		streamClaudeCli(model, context(), { timeoutMs: 25 });
+		const stream = streamClaudeCli(model, context(), { timeoutMs: 25 });
+		const eventsPromise = collectEvents(stream);
+
+		vi.advanceTimersByTime(25);
+
+		expect(child.kill).not.toHaveBeenCalled();
+		child.emit("close", 0);
+
+		const events = await eventsPromise;
+		expect(events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "text_delta",
+					delta: expect.stringContaining("no claude-cli output for 1s; still waiting"),
+				}),
+			]),
+		);
+	});
+
+	it("terminates claude subprocess when max runtime elapses", () => {
+		vi.useFakeTimers();
+		process.env.PI_CLAUDE_CLI_MAX_RUNTIME_MS = "25";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		streamClaudeCli(model, context(), {});
 
 		vi.advanceTimersByTime(25);
 
 		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
 	});
 
-	it("extends the idle timeout when claude emits stream activity", () => {
+	it("extends idle reporting when claude emits stream activity", () => {
 		vi.useFakeTimers();
 		const child = new MockChildProcess();
 		spawnMock.mockReturnValue(child);
@@ -315,7 +341,7 @@ describe("claude-cli provider", () => {
 
 		vi.advanceTimersByTime(5);
 
-		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+		expect(child.kill).not.toHaveBeenCalled();
 	});
 
 	it("parses claude stream-json final text and usage", async () => {
