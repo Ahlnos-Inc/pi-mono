@@ -131,6 +131,8 @@ describe("claude-cli provider", () => {
 	});
 
 	it("uses a sticky Claude session id across calls with the same system prompt", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+
 		streamClaudeCli(model, context("same system"), {});
 		streamClaudeCli(model, context("same system"), {});
 
@@ -144,6 +146,8 @@ describe("claude-cli provider", () => {
 	});
 
 	it("only sends inline prior Pi turns on the first sticky Claude call", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+
 		const child = new MockChildProcess();
 		spawnMock.mockReturnValueOnce(child).mockReturnValueOnce(new MockChildProcess());
 		const firstMessages: Message[] = [{ role: "user", content: "first question", timestamp: 1 }];
@@ -166,6 +170,8 @@ describe("claude-cli provider", () => {
 	});
 
 	it("catches up intervening non-Claude turns when returning to a sticky Claude session", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+
 		const firstChild = new MockChildProcess();
 		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
 
@@ -195,6 +201,8 @@ describe("claude-cli provider", () => {
 	});
 
 	it("sends compacted prior context when the Pi transcript shrinks", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+
 		const firstChild = new MockChildProcess();
 		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
 		const firstMessages: Message[] = [
@@ -224,6 +232,8 @@ describe("claude-cli provider", () => {
 	});
 
 	it("does not reuse sticky Claude sessions across Pi process starts", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+
 		const originalPid = Object.getOwnPropertyDescriptor(process, "pid");
 		Object.defineProperty(process, "pid", { configurable: true, value: 111 });
 		streamClaudeCli(model, context("same system"), {});
@@ -239,9 +249,7 @@ describe("claude-cli provider", () => {
 		if (originalPid) Object.defineProperty(process, "pid", originalPid);
 	});
 
-	it("can disable sticky Claude sessions with PI_CLAUDE_CLI_STICKY_SESSIONS=0", () => {
-		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "0";
-
+	it("does not send sticky Claude session IDs by default", () => {
 		streamClaudeCli(model, context(), {});
 
 		expect(spawnMock.mock.calls[0][1]).not.toContain("--session-id");

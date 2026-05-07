@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { registerSessionResourceCleanup } from "../session-resources.js";
 import type {
 	AssistantMessage,
 	Context,
@@ -52,9 +53,24 @@ type StickyClaudeSession = {
 };
 
 const stickySessions = new Map<string, StickyClaudeSession>();
+const activeChildren = new Set<ReturnType<typeof spawn>>();
+
+function cleanupClaudeCliSessionResources(): void {
+	for (const child of activeChildren) {
+		try {
+			child.kill("SIGTERM");
+		} catch {
+			/* noop */
+		}
+	}
+	activeChildren.clear();
+	stickySessions.clear();
+}
+
+registerSessionResourceCleanup(cleanupClaudeCliSessionResources);
 
 export function _clearClaudeCliStickySessionsForTest(): void {
-	stickySessions.clear();
+	cleanupClaudeCliSessionResources();
 }
 
 function positiveEnvInt(name: string): number | undefined {
@@ -77,7 +93,7 @@ function includeUserClaudeContext(): boolean {
 }
 
 function stickyClaudeSessionsEnabled(): boolean {
-	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_STICKY_SESSIONS ?? "");
+	return /^(1|true|yes|on)$/i.test(process.env.PI_CLAUDE_CLI_STICKY_SESSIONS ?? "");
 }
 
 function digestText(text: string): string {
@@ -369,6 +385,7 @@ function runClaudeCli(
 			cwd: `${home}/projects/ahlnos`,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		activeChildren.add(child);
 	} catch (spawnErr) {
 		const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
 		const errMessage = buildAssistantMessage(model, "", "error", `claude-cli spawn failed: ${msg}`);
@@ -433,6 +450,7 @@ function runClaudeCli(
 	}
 
 	const cleanup = () => {
+		activeChildren.delete(child);
 		if (idleTimer) clearTimeout(idleTimer);
 		if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
 		if (killTimer) clearTimeout(killTimer);
