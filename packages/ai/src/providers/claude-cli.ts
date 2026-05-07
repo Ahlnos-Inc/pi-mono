@@ -104,7 +104,7 @@ function includeUserClaudeContext(): boolean {
 }
 
 function stickyClaudeSessionsEnabled(): boolean {
-	return /^(1|true|yes|on)$/i.test(process.env.PI_CLAUDE_CLI_STICKY_SESSIONS ?? "");
+	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_STICKY_SESSIONS ?? "1");
 }
 
 function digestText(text: string): string {
@@ -460,6 +460,7 @@ function runClaudeCli(
 	let displayText = "";
 	let responseModel: string | undefined;
 	let finalUsage: Usage | undefined;
+	let sawClaudeSessionActivity = false;
 	let aborted = false;
 	let maxRuntimeTimedOut = false;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -552,6 +553,7 @@ function runClaudeCli(
 
 	const handleClaudeEvent = (event: ClaudeCliJson) => {
 		if (event.type === "system") {
+			sawClaudeSessionActivity = true;
 			if (event.subtype === "init") {
 				responseModel = typeof event.model === "string" ? event.model : responseModel;
 				const toolCount = Array.isArray(event.tools) ? event.tools.length : undefined;
@@ -567,6 +569,7 @@ function runClaudeCli(
 		if (event.type === "stream_event" && event.event && typeof event.event === "object") {
 			const streamEvent = event.event as ClaudeCliJson;
 			if (streamEvent.type === "message_start") {
+				sawClaudeSessionActivity = true;
 				const messageModel = streamEvent.message?.model;
 				if (typeof messageModel === "string") responseModel = messageModel;
 				appendActivity(`model turn started (${responseModel ?? model.id})`);
@@ -650,12 +653,14 @@ function runClaudeCli(
 		}
 
 		if (event.type === "assistant") {
+			sawClaudeSessionActivity = true;
 			const messageModel = event.message?.model;
 			if (typeof messageModel === "string") responseModel = messageModel;
 			return;
 		}
 
 		if (event.type === "result") {
+			sawClaudeSessionActivity = true;
 			if (typeof event.result === "string") finalText = event.result;
 			finalUsage = usageFromClaudeResult(event);
 			if (stickySession) {
@@ -720,6 +725,10 @@ function runClaudeCli(
 		}
 
 		if (maxRuntimeTimedOut) {
+			if (stickySession && sawClaudeSessionActivity && stickySession.turns === 0) {
+				stickySession.turns = 1;
+				stickySession.seenMessageCount = nextSeenMessageCount;
+			}
 			const seconds = Math.ceil((maxRuntimeMs ?? idleTimeoutMs) / 1000);
 			const timedOutMessage = buildAssistantMessage(
 				model,

@@ -283,7 +283,15 @@ describe("claude-cli provider", () => {
 		if (originalPid) Object.defineProperty(process, "pid", originalPid);
 	});
 
-	it("does not send sticky Claude session IDs by default", () => {
+	it("sends sticky Claude session IDs by default", () => {
+		streamClaudeCli(model, context(), {});
+
+		expect(spawnMock.mock.calls[0][1]).toContain("--session-id");
+	});
+
+	it("can disable sticky Claude session IDs explicitly", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "0";
+
 		streamClaudeCli(model, context(), {});
 
 		expect(spawnMock.mock.calls[0][1]).not.toContain("--session-id");
@@ -324,6 +332,35 @@ describe("claude-cli provider", () => {
 		vi.advanceTimersByTime(25);
 
 		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+	});
+
+	it("keeps the sticky Claude session initialized after a max runtime timeout with activity", () => {
+		vi.useFakeTimers();
+		process.env.PI_CLAUDE_CLI_MAX_RUNTIME_MS = "25";
+		const firstChild = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
+
+		streamClaudeCli(model, context("same system"), {});
+		writeJsonl(firstChild, [{ type: "system", subtype: "init", model: model.id, tools: ["Bash"] }]);
+		vi.advanceTimersByTime(25);
+		firstChild.emit("close", null);
+
+		const messages: Message[] = [
+			{ role: "user", content: "hello", timestamp: 1 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "claude-cli max runtime timed out" }],
+				timestamp: 2,
+			} as Message,
+			{ role: "user", content: "continue", timestamp: 3 },
+		];
+		streamClaudeCli(model, contextWithMessages(messages, "same system"), {});
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		expect(firstArgs).toEqual(expect.arrayContaining(["--system-prompt", "same system"]));
+		expect(secondArgs).not.toContain("--system-prompt");
+		expect(secondArgs.at(-1)).toBe("continue");
 	});
 
 	it("extends idle reporting when claude emits stream activity", () => {
