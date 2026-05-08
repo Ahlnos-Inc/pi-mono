@@ -440,6 +440,64 @@ describe("claude-cli provider", () => {
 		expect(secondSession).toBe(firstSession);
 	});
 
+	it("reuses sticky session across pi-mono process boundaries when pi-router-session marker matches", () => {
+		// Simulates the cross-pi-process workstream-reuse scenario:
+		// - User starts pi window A, runs a turn → spawns Claude session S1.
+		// - Pi window A is closed (or another pi window B is opened in parallel).
+		// - Pi window B runs a turn in the SAME workstream (same agent + project).
+		// Expected: window B's turn resumes S1 via SQLite registry, not a new spawn.
+		// This is enforced by deriving the session-key boundary from the marker
+		// digest when present, instead of from the per-pi-mono sessionId/pid.
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+		const originalPid = Object.getOwnPropertyDescriptor(process, "pid");
+		const firstChild = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
+
+		const marker = `<!-- pi-router-session agent="agency/engineering/engineering-devops-automator" project="pi-infra" -->`;
+		const systemPrompt = `${marker}\n\nrest of the agent prepend block content`;
+
+		// Window A: pid 111, pi-mono session "windowA-uuid"
+		Object.defineProperty(process, "pid", { configurable: true, value: 111 });
+		streamClaudeCli(model, context(systemPrompt), { sessionId: "windowA-uuid" });
+		writeJsonl(firstChild, [{ type: "result", subtype: "success", result: "ok", usage: {} }]);
+
+		// Window B: different pid AND different pi-mono session id, same workstream marker
+		Object.defineProperty(process, "pid", { configurable: true, value: 222 });
+		streamClaudeCli(model, context(systemPrompt), { sessionId: "windowB-uuid" });
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+		const secondSession = secondArgs[secondArgs.indexOf("--resume") + 1];
+
+		// Cross-pi-process reuse: same Claude session id resumed in window B.
+		expect(secondSession).toBe(firstSession);
+		expect(secondArgs).toContain("--resume");
+
+		if (originalPid) Object.defineProperty(process, "pid", originalPid);
+	});
+
+	it("does NOT reuse sticky session across pi-mono process boundaries when no marker is present", () => {
+		// Defensive: direct claude-cli calls outside the router (no marker) should
+		// keep their per-pi-process isolation so unrelated pi instances don't
+		// accidentally share Claude sessions.
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+		const originalPid = Object.getOwnPropertyDescriptor(process, "pid");
+
+		Object.defineProperty(process, "pid", { configurable: true, value: 111 });
+		streamClaudeCli(model, context("plain system prompt, no router marker"), {});
+		Object.defineProperty(process, "pid", { configurable: true, value: 222 });
+		streamClaudeCli(model, context("plain system prompt, no router marker"), {});
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+		const secondSession = secondArgs[secondArgs.indexOf("--session-id") + 1];
+
+		expect(secondSession).not.toBe(firstSession);
+		if (originalPid) Object.defineProperty(process, "pid", originalPid);
+	});
+
 	it("sends sticky Claude session IDs by default", () => {
 		streamClaudeCli(model, context(), {});
 

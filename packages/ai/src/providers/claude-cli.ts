@@ -329,12 +329,18 @@ function extractRouterSessionMarker(systemPrompt: string | undefined): string | 
 }
 
 function stickySessionKey(model: Model<"claude-cli">, context: Context, options?: StreamOptions): string {
-	const sessionKey = claudeSessionBoundaryId(options);
-	// When the router has injected a stable session-identity marker, use its
-	// digest as the system-prompt hash component. This makes consecutive turns
-	// with the same agent/project map to the same sticky session key regardless
-	// of L2/L3 memory-block changes in the agent system-prompt prepend.
+	// When the router has injected a stable workstream-identity marker
+	// (`<!-- pi-router-session agent="..." project="..." -->`), use the
+	// marker as BOTH the boundary id AND the system-prompt hash component.
+	// Result: two different pi-mono processes (or the same process after
+	// restart) routing the same workstream produce the SAME session_key →
+	// SQLite registry hits → existing Claude session is resumed instead of
+	// a new one being spawned. Cross-pi-process workstream reuse, not just
+	// within-process. When no marker (direct claude-cli calls outside the
+	// router), fall back to the per-pi-mono-session boundary so unrelated
+	// pi processes don't accidentally share sessions.
 	const marker = extractRouterSessionMarker(context.systemPrompt);
+	const sessionKey = marker ? `workstream:${digestText(marker)}` : claudeSessionBoundaryId(options);
 	const systemPromptHash = marker
 		? digestText(marker)
 		: digestText(stableSystemPromptForClaudeSession(context.systemPrompt));
