@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { registerSessionResourceCleanup } from "../session-resources.js";
@@ -31,10 +31,11 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * personal context (Gmail/Drive/superpowers/etc.) into every Pi provider call. Set
  * PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT=1 to restore the full user Claude Code environment.
  *
- * Streaming: claude is invoked with `--output-format stream-json`, which emits JSONL records
- * for model deltas, tool calls, tool results, lifecycle status, and the final result. Pi still
- * treats claude-cli as one provider call: Claude's internal tool calls are surfaced as compact
- * activity text only, never as Pi ToolCall blocks, so Pi does not re-execute them.
+ * Streaming: claude is invoked with stream-json input and output. Pi writes the user prompt as
+ * a JSONL envelope on stdin and reads JSONL records for model deltas, tool calls, tool results,
+ * lifecycle status, and the final result. Pi still treats claude-cli as one provider call:
+ * Claude's internal tool calls are surfaced as compact activity text only, never as Pi ToolCall
+ * blocks, so Pi does not re-execute them.
  *
  * System prompt is passed via `claude -p --system-prompt` when present so Pi's prompt
  * replaces Claude Code's default agent prompt instead of stacking on top of it.
@@ -56,17 +57,32 @@ const KILL_GRACE_MS = 5_000;
  * once values are no longer small command-line arguments.
  */
 const MAX_CLAUDE_DYNAMIC_ARG_BYTES = 64 * 1024;
+const VOLATILE_SYSTEM_PROMPT_BLOCK_RE =
+	/<!-- pi-router: retrieved (?:context|memory) -->[\s\S]*?<!-- \/pi-router: retrieved (?:context|memory) -->/g;
 
 type StickyClaudeSession = {
+	sessionKey: string;
+	sessionKeyHash: string;
 	sessionId: string;
 	turns: number;
 	seenMessageCount: number;
+	reuseStatus: "new" | "resume" | "disabled" | "stale-recreated" | "ephemeral";
+	model: string;
+	cwd: string;
+	systemPromptHash: string;
+	toolPolicyHash: string;
+	ephemeral?: boolean;
 };
 
 const stickySessions = new Map<string, StickyClaudeSession>();
 const activeChildren = new Set<ReturnType<typeof spawn>>();
+const claudeWorkers = new Map<string, ClaudeWorker>();
 
 function cleanupClaudeCliSessionResources(): void {
+	for (const worker of claudeWorkers.values()) {
+		worker.stop();
+	}
+	claudeWorkers.clear();
 	for (const child of activeChildren) {
 		try {
 			child.kill("SIGTERM");
@@ -107,6 +123,22 @@ function stickyClaudeSessionsEnabled(): boolean {
 	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_STICKY_SESSIONS ?? "1");
 }
 
+function claudeSessionReuseDisabled(options?: StreamOptions): boolean {
+	return (
+		options?.metadata?.disableClaudeSessionReuse === true ||
+		options?.metadata?.claudeCliSessionReuse === false ||
+		options?.metadata?.sessionPurpose === "compaction"
+	);
+}
+
+function claudeSessionRegistryEnabled(): boolean {
+	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_SESSION_REGISTRY ?? "1");
+}
+
+function claudeWorkersEnabled(): boolean {
+	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_WORKERS ?? "1");
+}
+
 function digestText(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
@@ -118,20 +150,290 @@ function uuidFromKey(key: string): string {
 	return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20, 32).join("")}`;
 }
 
-function stickySessionKey(model: Model<"claude-cli">, context: Context): string {
-	const sessionKey = `${process.pid}:${process.env.PI_SESSION_ID ?? ""}`;
-	const systemPromptHash = digestText(context.systemPrompt ?? "");
-	return [process.cwd(), sessionKey, model.id, systemPromptHash].join("\n");
+type ClaudeRegistryRecord = {
+	claude_session_id: string;
+	turns: number;
+	last_seen_message_count: number;
+};
+
+function piRoot(): string {
+	return process.env.PI_ROOT ?? join(process.env.HOME ?? "/root", ".pi");
 }
 
-function getStickySession(model: Model<"claude-cli">, context: Context): StickyClaudeSession | undefined {
+function claudeSessionRegistryPath(): string {
+	return process.env.PI_CLAUDE_CLI_SESSION_DB ?? join(piRoot(), "state", "claude-cli-sessions.sqlite");
+}
+
+function sqlString(value: string): string {
+	return `'${value.replaceAll("'", "''")}'`;
+}
+
+function runClaudeRegistrySql(sql: string): string | undefined {
+	if (!claudeSessionRegistryEnabled()) return undefined;
+	const dbPath = claudeSessionRegistryPath();
+	try {
+		mkdirSync(dirname(dbPath), { recursive: true });
+		const result = spawnSync("sqlite3", ["-batch", "-json", dbPath, sql], {
+			encoding: "utf8",
+			timeout: 1000,
+		});
+		if (result.status !== 0 || result.error) return undefined;
+		return result.stdout ?? "";
+	} catch {
+		return undefined;
+	}
+}
+
+function ensureClaudeSessionRegistry(): void {
+	runClaudeRegistrySql(`
+create table if not exists claude_sessions (
+  session_key text primary key,
+  claude_session_id text not null,
+  provider text not null,
+  model text not null,
+  effort text,
+  cwd text not null,
+  project_class text,
+  agent_chosen text,
+  data_class text,
+  system_prompt_hash text not null,
+  tool_policy_hash text not null,
+  turns integer not null default 0,
+  last_seen_message_count integer not null default 0,
+  created_at text not null,
+  updated_at text not null,
+  last_status text not null default 'ok'
+);
+create table if not exists claude_session_workers (
+  session_key text primary key,
+  claude_session_id text not null,
+  pid integer,
+  boundary_hash text not null,
+  started_at text,
+  last_used_at text,
+  status text not null
+);`);
+}
+
+function readClaudeSessionRegistry(sessionKey: string): ClaudeRegistryRecord | undefined {
+	if (!claudeSessionRegistryEnabled()) return undefined;
+	ensureClaudeSessionRegistry();
+	const rows = runClaudeRegistrySql(
+		`select claude_session_id, turns, last_seen_message_count from claude_sessions where session_key = ${sqlString(sessionKey)} limit 1;`,
+	);
+	if (!rows?.trim()) return undefined;
+	try {
+		const parsed = JSON.parse(rows) as ClaudeRegistryRecord[];
+		const row = parsed[0];
+		if (!row || typeof row.claude_session_id !== "string") return undefined;
+		return {
+			claude_session_id: row.claude_session_id,
+			turns: Number.isFinite(row.turns) ? row.turns : 0,
+			last_seen_message_count: Number.isFinite(row.last_seen_message_count) ? row.last_seen_message_count : 0,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function upsertClaudeSessionRegistry(session: StickyClaudeSession, status: string): void {
+	if (session.ephemeral) return;
+	if (!claudeSessionRegistryEnabled()) return;
+	ensureClaudeSessionRegistry();
+	const now = new Date().toISOString();
+	runClaudeRegistrySql(`
+insert into claude_sessions (
+  session_key, claude_session_id, provider, model, effort, cwd, project_class,
+  agent_chosen, data_class, system_prompt_hash, tool_policy_hash, turns,
+  last_seen_message_count, created_at, updated_at, last_status
+) values (
+  ${sqlString(session.sessionKey)}, ${sqlString(session.sessionId)}, 'claude-cli',
+  ${sqlString(session.model)}, null, ${sqlString(session.cwd)}, null, null, null,
+  ${sqlString(session.systemPromptHash)}, ${sqlString(session.toolPolicyHash)},
+  ${session.turns}, ${session.seenMessageCount}, ${sqlString(now)}, ${sqlString(now)}, ${sqlString(status)}
+) on conflict(session_key) do update set
+  claude_session_id=excluded.claude_session_id,
+  model=excluded.model,
+  cwd=excluded.cwd,
+  system_prompt_hash=excluded.system_prompt_hash,
+  tool_policy_hash=excluded.tool_policy_hash,
+  turns=excluded.turns,
+  last_seen_message_count=excluded.last_seen_message_count,
+  updated_at=excluded.updated_at,
+  last_status=excluded.last_status;`);
+}
+
+function markClaudeSessionWorker(session: StickyClaudeSession, pid: number | undefined, status: string): void {
+	if (session.ephemeral) return;
+	if (!claudeSessionRegistryEnabled()) return;
+	ensureClaudeSessionRegistry();
+	const now = new Date().toISOString();
+	runClaudeRegistrySql(`
+insert into claude_session_workers (
+  session_key, claude_session_id, pid, boundary_hash, started_at, last_used_at, status
+) values (
+  ${sqlString(session.sessionKey)}, ${sqlString(session.sessionId)}, ${pid ?? "null"},
+  ${sqlString(session.sessionKeyHash)}, ${sqlString(now)}, ${sqlString(now)}, ${sqlString(status)}
+) on conflict(session_key) do update set
+  claude_session_id=excluded.claude_session_id,
+  pid=excluded.pid,
+  boundary_hash=excluded.boundary_hash,
+  last_used_at=excluded.last_used_at,
+  status=excluded.status;`);
+}
+
+function appendClaudeSessionTelemetry(
+	session: StickyClaudeSession,
+	event: string,
+	extra: Record<string, unknown> = {},
+): void {
+	if (/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_SESSION_TELEMETRY ?? "1")) return;
+	try {
+		const logsDir = join(piRoot(), "logs");
+		mkdirSync(logsDir, { recursive: true });
+		const username = process.env.USER ?? "unknown";
+		appendFileSync(
+			join(logsDir, `claude-cli-sessions-${username}.jsonl`),
+			`${JSON.stringify({
+				ts: new Date().toISOString(),
+				event,
+				claude_session_reuse: session.reuseStatus,
+				claude_session_id: session.sessionId,
+				claude_session_key_hash: session.sessionKeyHash,
+				claude_session_turns_before: session.turns,
+				claude_session_boundary: {
+					cwd: session.cwd,
+					model: session.model,
+					system_prompt_hash: session.systemPromptHash,
+					tool_policy_hash: session.toolPolicyHash,
+				},
+				...extra,
+			})}\n`,
+			"utf8",
+		);
+	} catch {
+		// Telemetry is best-effort and must not block model dispatch.
+	}
+}
+
+/**
+ * Extracts the stable `<!-- pi-router-session agent="..." project="..." -->`
+ * marker injected by the router extension's `before_agent_start` hook.
+ * Returns the raw attribute string (e.g. `agent="foo" project="bar"`) when
+ * present, or undefined when the prompt has no such marker (e.g. direct
+ * claude-cli calls outside the router).
+ */
+function extractRouterSessionMarker(systemPrompt: string | undefined): string | undefined {
+	const match = /<!-- pi-router-session ([^>]+) -->/.exec(systemPrompt ?? "");
+	return match ? match[1].trim() : undefined;
+}
+
+function stickySessionKey(model: Model<"claude-cli">, context: Context, options?: StreamOptions): string {
+	const sessionKey = claudeSessionBoundaryId(options);
+	// When the router has injected a stable session-identity marker, use its
+	// digest as the system-prompt hash component. This makes consecutive turns
+	// with the same agent/project map to the same sticky session key regardless
+	// of L2/L3 memory-block changes in the agent system-prompt prepend.
+	const marker = extractRouterSessionMarker(context.systemPrompt);
+	const systemPromptHash = marker
+		? digestText(marker)
+		: digestText(stableSystemPromptForClaudeSession(context.systemPrompt));
+	const toolPolicyHash = digestText(
+		JSON.stringify({
+			includeUserClaudeContext: includeUserClaudeContext(),
+			tools: "default",
+			permissionMode: "bypassPermissions",
+			addDirs: ["Vault-V2", ".pi", "projects/ahlnos"],
+		}),
+	);
+	return [process.cwd(), sessionKey, model.id, systemPromptHash, toolPolicyHash].join("\n");
+}
+
+function claudeSessionBoundaryId(options?: StreamOptions): string {
+	const explicitSessionId = options?.sessionId?.trim();
+	if (explicitSessionId) return `session:${explicitSessionId}`;
+	const envSessionId = process.env.PI_SESSION_ID?.trim();
+	if (envSessionId) return `session:${envSessionId}`;
+	return `pid:${process.pid}`;
+}
+
+function getStickySession(
+	model: Model<"claude-cli">,
+	context: Context,
+	options?: StreamOptions,
+): StickyClaudeSession | undefined {
 	if (!stickyClaudeSessionsEnabled()) return undefined;
-	const key = stickySessionKey(model, context);
+	const key = stickySessionKey(model, context, options);
 	const existing = stickySessions.get(key);
 	if (existing) return existing;
-	const session = { sessionId: uuidFromKey(`pi-claude-cli\n${key}`), turns: 0, seenMessageCount: 0 };
+	const metadata = claudeSessionMetadata(model, context, key);
+	const registryRecord = readClaudeSessionRegistry(key);
+	const session = registryRecord
+		? {
+				...metadata,
+				sessionId: registryRecord.claude_session_id,
+				turns: registryRecord.turns,
+				seenMessageCount: registryRecord.last_seen_message_count,
+				reuseStatus: "resume" as const,
+			}
+		: {
+				...metadata,
+				sessionId: uuidFromKey(`pi-claude-cli\n${key}`),
+				turns: 0,
+				seenMessageCount: 0,
+				reuseStatus: "new" as const,
+			};
+	upsertClaudeSessionRegistry(session, "ok");
 	stickySessions.set(key, session);
 	return session;
+}
+
+function createEphemeralClaudeSession(
+	model: Model<"claude-cli">,
+	context: Context,
+	options?: StreamOptions,
+): StickyClaudeSession {
+	const key = `${stickySessionKey(model, context, options)}\nephemeral\n${randomUUID()}`;
+	return {
+		...claudeSessionMetadata(model, context, key),
+		sessionId: randomUUID(),
+		turns: 0,
+		seenMessageCount: 0,
+		reuseStatus: "ephemeral",
+		ephemeral: true,
+	};
+}
+
+function claudeSessionMetadata(model: Model<"claude-cli">, context: Context, key: string) {
+	return {
+		sessionKey: key,
+		sessionKeyHash: digestText(key),
+		model: model.id,
+		cwd: process.cwd(),
+		systemPromptHash: digestText(stableSystemPromptForClaudeSession(context.systemPrompt)),
+		toolPolicyHash: digestText(
+			JSON.stringify({
+				includeUserClaudeContext: includeUserClaudeContext(),
+				tools: "default",
+				permissionMode: "bypassPermissions",
+				addDirs: ["Vault-V2", ".pi", "projects/ahlnos"],
+			}),
+		),
+	};
+}
+
+function stableSystemPromptForClaudeSession(systemPrompt?: string): string {
+	return (systemPrompt ?? "")
+		.replace(VOLATILE_SYSTEM_PROMPT_BLOCK_RE, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+function extractVolatileSystemPromptBlocks(systemPrompt?: string): string | undefined {
+	const matches = [...(systemPrompt ?? "").matchAll(VOLATILE_SYSTEM_PROMPT_BLOCK_RE)]
+		.map((match) => match[0].trim())
+		.filter(Boolean);
+	return matches.length > 0 ? matches.join("\n\n") : undefined;
 }
 
 function latestUserIndex(context: Context): number {
@@ -161,11 +463,21 @@ function renderPromptWithContext(
 	latestText: string,
 	priorTurns: { label: "USER" | "ASSISTANT"; text: string }[],
 	label: string,
+	currentTurnContext?: string,
 ): string {
 	const trimmed = priorTurns.slice(-MAX_PRIOR_TURNS);
-	if (trimmed.length === 0) return latestText;
-	const contextBlock = trimmed.map((t) => `[${t.label}]\n${t.text}`).join("\n\n");
-	return `${label}:\n\n${contextBlock}\n\n---\n\nCurrent question:\n${latestText}`;
+	const sections: string[] = [];
+	if (currentTurnContext) {
+		sections.push(
+			`Current turn Pi retrieved context and memory (use as supporting evidence for the question that follows):\n\n${currentTurnContext}`,
+		);
+	}
+	if (trimmed.length > 0) {
+		const contextBlock = trimmed.map((t) => `[${t.label}]\n${t.text}`).join("\n\n");
+		sections.push(`${label}:\n\n${contextBlock}`);
+	}
+	if (sections.length === 0) return latestText;
+	return `${sections.join("\n\n---\n\n")}\n\n---\n\nCurrent question:\n${latestText}`;
 }
 
 function extractPrompt(context: Context, stickySession?: StickyClaudeSession): string {
@@ -206,6 +518,7 @@ function extractPrompt(context: Context, stickySession?: StickyClaudeSession): s
 		latestText,
 		unseenPriorTurns,
 		"Intervening Pi conversation since your last Claude turn (most recent last) — use as background for the question that follows",
+		extractVolatileSystemPromptBlocks(context.systemPrompt),
 	);
 }
 
@@ -287,9 +600,13 @@ function cleanupClaudeArgTempFiles(files: string[]): void {
 
 type ClaudeInvocation = {
 	args: string[];
-	stdinPrompt?: string;
+	stdinPayload: string;
 	tempFiles: string[];
 };
+
+function claudeUserInputJsonl(prompt: string): string {
+	return `${JSON.stringify({ type: "user", message: { role: "user", content: prompt } })}\n`;
+}
 
 function buildClaudeInvocation(
 	model: Model<"claude-cli">,
@@ -302,6 +619,8 @@ function buildClaudeInvocation(
 	const args = [
 		"-p",
 		"--verbose",
+		"--input-format",
+		"stream-json",
 		"--output-format",
 		"stream-json",
 		"--include-partial-messages",
@@ -309,7 +628,9 @@ function buildClaudeInvocation(
 		model.id,
 	];
 
-	if (stickySession) args.push("--session-id", stickySession.sessionId);
+	if (stickySession) {
+		args.push(stickySession.turns > 0 ? "--resume" : "--session-id", stickySession.sessionId);
+	}
 
 	if (!includeUserClaudeContext()) {
 		args.push("--setting-sources", "local", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
@@ -339,14 +660,7 @@ function buildClaudeInvocation(
 		}
 	}
 
-	let stdinPrompt: string | undefined;
-	if (shouldExternalizeClaudeArg(prompt)) {
-		stdinPrompt = prompt;
-	} else {
-		args.push(prompt);
-	}
-
-	return { args, stdinPrompt, tempFiles };
+	return { args, stdinPayload: claudeUserInputJsonl(prompt), tempFiles };
 }
 
 type ClaudeCliJson = Record<string, any>;
@@ -414,13 +728,394 @@ function activityLine(text: string): string {
 	return `[claude-cli] ${text}\n`;
 }
 
-function runClaudeCli(
+type ClaudeRequestState = {
+	stream: ReturnType<typeof createAssistantMessageEventStream>;
+	handleEvent: (event: ClaudeCliJson) => boolean;
+	fail: (stopReason: AssistantMessage["stopReason"], errorMessage: string) => void;
+	finish: () => void;
+	resetIdleTimer: () => void;
+	cleanup: () => void;
+};
+
+function createWorkerRequestState(input: {
+	model: Model<"claude-cli">;
+	options?: { signal?: AbortSignal; timeoutMs?: number };
+	stickySession: StickyClaudeSession;
+	nextSeenMessageCount: number;
+	terminateWorker: () => void;
+}): ClaudeRequestState {
+	const stream = createAssistantMessageEventStream();
+	const idleTimeoutMs = resolveIdleTimeoutMs(input.options?.timeoutMs);
+	const maxRuntimeMs = resolveMaxRuntimeMs();
+	let finalText = "";
+	let displayText = "";
+	let responseModel: string | undefined;
+	let finalUsage: Usage | undefined;
+	let idleTimer: ReturnType<typeof setTimeout> | undefined;
+	let maxRuntimeTimer: ReturnType<typeof setTimeout> | undefined;
+	const blocks = new Map<number, ClaudeCliContentBlockState>();
+	const partial: AssistantMessage = buildAssistantMessage(input.model, "", "stop");
+
+	const updateDisplay = (nextText: string, delta: string) => {
+		resetIdleTimer();
+		displayText = nextText;
+		(partial.content[0] as TextContent).text = displayText;
+		stream.push({
+			type: "text_delta",
+			contentIndex: 0,
+			delta,
+			partial: { ...partial, content: [{ type: "text", text: displayText }] },
+		});
+	};
+
+	const appendActivity = (text: string) => {
+		if (finalText) return;
+		const line = activityLine(text);
+		updateDisplay(displayText + line, line);
+	};
+
+	function resetIdleTimer() {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = setTimeout(() => {
+			const seconds = Math.ceil(idleTimeoutMs / 1000);
+			appendActivity(`no claude-cli output for ${seconds}s; still waiting`);
+			resetIdleTimer();
+		}, idleTimeoutMs);
+	}
+
+	const onAbort = () => {
+		input.terminateWorker();
+		fail("aborted", "claude-cli aborted");
+	};
+
+	function cleanup() {
+		if (idleTimer) clearTimeout(idleTimer);
+		if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
+		if (input.options?.signal) input.options.signal.removeEventListener("abort", onAbort);
+	}
+
+	function fail(stopReason: AssistantMessage["stopReason"], errorMessage: string) {
+		cleanup();
+		upsertClaudeSessionRegistry(input.stickySession, "error");
+		appendClaudeSessionTelemetry(input.stickySession, "worker-error", { error: errorMessage });
+		const message = buildAssistantMessage(
+			input.model,
+			finalText || displayText,
+			stopReason,
+			errorMessage,
+			finalUsage,
+			responseModel,
+		);
+		stream.push({ type: "error", reason: stopReason === "aborted" ? "aborted" : "error", error: message });
+		stream.end(message);
+	}
+
+	function finish() {
+		cleanup();
+		const resolvedFinalText = finalText.trimEnd();
+		(partial.content[0] as TextContent).text = resolvedFinalText;
+		stream.push({
+			type: "text_end",
+			contentIndex: 0,
+			content: resolvedFinalText,
+			partial: { ...partial, content: [{ type: "text", text: resolvedFinalText }] },
+		});
+		const finalMessage = buildAssistantMessage(
+			input.model,
+			resolvedFinalText,
+			"stop",
+			undefined,
+			finalUsage,
+			responseModel,
+		);
+		stream.push({ type: "done", reason: "stop", message: finalMessage });
+		stream.end(finalMessage);
+	}
+
+	const handleEvent = (event: ClaudeCliJson): boolean => {
+		resetIdleTimer();
+		if (event.type === "system") {
+			if (event.subtype === "init") {
+				responseModel = typeof event.model === "string" ? event.model : responseModel;
+				const toolCount = Array.isArray(event.tools) ? event.tools.length : undefined;
+				appendActivity(
+					toolCount ? `initialized ${event.model ?? input.model.id} with ${toolCount} tools` : "initialized",
+				);
+			} else if (event.subtype === "status" && typeof event.status === "string") {
+				appendActivity(event.status === "requesting" ? "requesting model response" : event.status);
+			}
+			return false;
+		}
+
+		if (event.type === "stream_event" && event.event && typeof event.event === "object") {
+			const streamEvent = event.event as ClaudeCliJson;
+			if (streamEvent.type === "message_start") {
+				const messageModel = streamEvent.message?.model;
+				if (typeof messageModel === "string") responseModel = messageModel;
+				appendActivity(`model turn started (${responseModel ?? input.model.id})`);
+				return false;
+			}
+			if (streamEvent.type === "content_block_start") {
+				const index = numberValue(streamEvent.index);
+				const block = streamEvent.content_block as ClaudeCliJson | undefined;
+				const blockType = typeof block?.type === "string" ? block.type : "unknown";
+				if (blockType === "text") {
+					blocks.set(index, { type: "text", text: "" });
+					if (!finalText && displayText) updateDisplay("", "");
+				} else if (blockType === "tool_use") {
+					const toolName = typeof block?.name === "string" ? block.name : "tool";
+					blocks.set(index, {
+						type: "tool_use",
+						id: typeof block?.id === "string" ? block.id : undefined,
+						name: toolName,
+						inputJson: "",
+						announcedInput: false,
+					});
+					appendActivity(`preparing ${toolName}`);
+				} else {
+					blocks.set(index, { type: blockType });
+				}
+				return false;
+			}
+			if (streamEvent.type === "content_block_delta") {
+				const index = numberValue(streamEvent.index);
+				const block = blocks.get(index);
+				const delta = streamEvent.delta as ClaudeCliJson | undefined;
+				if (!block || !delta) return false;
+				if (block.type === "text" && delta.type === "text_delta" && typeof delta.text === "string") {
+					finalText += delta.text;
+					updateDisplay(finalText, delta.text);
+				}
+				if (
+					block.type === "tool_use" &&
+					delta.type === "input_json_delta" &&
+					typeof delta.partial_json === "string"
+				) {
+					block.inputJson = `${block.inputJson ?? ""}${delta.partial_json}`;
+					if (!block.announcedInput) {
+						try {
+							const summary = summarizeToolInput(block.name, JSON.parse(block.inputJson));
+							appendActivity(summary ? `running ${block.name}: ${summary}` : `running ${block.name}`);
+							block.announcedInput = true;
+						} catch {
+							// Wait for complete JSON.
+						}
+					}
+				}
+				return false;
+			}
+			if (streamEvent.type === "content_block_stop") {
+				const index = numberValue(streamEvent.index);
+				const block = blocks.get(index);
+				if (block?.type === "tool_use" && !block.announcedInput) appendActivity(`running ${block.name ?? "tool"}`);
+				blocks.delete(index);
+				return false;
+			}
+			if (streamEvent.type === "message_delta" && streamEvent.delta?.stop_reason === "tool_use")
+				appendActivity("waiting for tool result");
+			return false;
+		}
+
+		if (event.type === "user" && event.tool_use_result && typeof event.tool_use_result === "object") {
+			const result = event.tool_use_result as ClaudeCliJson;
+			appendActivity(
+				result.is_error === true || result.interrupted === true ? "tool returned an error" : "tool completed",
+			);
+			return false;
+		}
+
+		if (event.type === "assistant") {
+			const messageModel = event.message?.model;
+			if (typeof messageModel === "string") responseModel = messageModel;
+			return false;
+		}
+
+		if (event.type === "result") {
+			if (typeof event.result === "string") finalText = event.result;
+			finalUsage = usageFromClaudeResult(event);
+			input.stickySession.turns += 1;
+			input.stickySession.seenMessageCount = input.nextSeenMessageCount;
+			input.stickySession.reuseStatus = "resume";
+			upsertClaudeSessionRegistry(input.stickySession, "ok");
+			appendClaudeSessionTelemetry(input.stickySession, "worker-result", {
+				response_model: responseModel,
+				usage_input_tokens: finalUsage?.input,
+				usage_output_tokens: finalUsage?.output,
+			});
+			return true;
+		}
+		return false;
+	};
+
+	stream.push({ type: "start", partial });
+	partial.content = [{ type: "text", text: "" }];
+	stream.push({ type: "text_start", contentIndex: 0, partial: { ...partial, content: [{ type: "text", text: "" }] } });
+	resetIdleTimer();
+	if (maxRuntimeMs !== undefined) {
+		maxRuntimeTimer = setTimeout(() => {
+			input.terminateWorker();
+			fail("error", `claude-cli max runtime timed out after ${Math.ceil(maxRuntimeMs / 1000)}s`);
+		}, maxRuntimeMs);
+	}
+	if (input.options?.signal) {
+		if (input.options.signal.aborted) onAbort();
+		else input.options.signal.addEventListener("abort", onAbort, { once: true });
+	}
+
+	return { stream, handleEvent, fail, finish, resetIdleTimer, cleanup };
+}
+
+type ClaudeWorkerQueueItem = {
+	prompt: string;
+	state: ClaudeRequestState;
+};
+
+class ClaudeWorker {
+	private child: ReturnType<typeof spawn>;
+	private lineBuffer = "";
+	private stderr = "";
+	private pending: ClaudeWorkerQueueItem | undefined;
+	private queue: ClaudeWorkerQueueItem[] = [];
+	private idleTimer: ReturnType<typeof setTimeout> | undefined;
+	private tempFiles: string[] = [];
+	private stopped = false;
+
+	constructor(
+		model: Model<"claude-cli">,
+		context: Context,
+		private readonly stickySession: StickyClaudeSession,
+	) {
+		const invocation = buildClaudeInvocation(model, context, "", stickySession);
+		this.tempFiles = invocation.tempFiles;
+		const childEnv: NodeJS.ProcessEnv = { ...process.env };
+		delete childEnv.ANTHROPIC_API_KEY;
+		delete childEnv.ANTHROPIC_AUTH_TOKEN;
+		delete childEnv.ANTHROPIC_BASE_URL;
+		const home = process.env.HOME ?? "/root";
+		this.child = spawn("claude", invocation.args, {
+			env: childEnv,
+			cwd: `${home}/projects/ahlnos`,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		activeChildren.add(this.child);
+		markClaudeSessionWorker(stickySession, this.child.pid, "running");
+		appendClaudeSessionTelemetry(stickySession, stickySession.turns === 0 ? "worker-start-new" : "worker-resume");
+		this.child.stdout?.setEncoding("utf8");
+		this.child.stderr?.setEncoding("utf8");
+		this.child.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
+		this.child.stderr?.on("data", (chunk: string) => {
+			this.stderr += chunk;
+			this.pending?.state.resetIdleTimer();
+		});
+		this.child.on("error", (err) => this.failAll(`claude-cli worker error: ${err.message}`));
+		this.child.on("close", (code) => {
+			cleanupClaudeArgTempFiles(this.tempFiles);
+			activeChildren.delete(this.child);
+			claudeWorkers.delete(this.stickySession.sessionKey);
+			markClaudeSessionWorker(stickySession, undefined, "closed");
+			if (!this.stopped && (this.pending || this.queue.length > 0)) {
+				this.failAll(this.stderr.trim() || `claude-cli worker exited with code ${code}`);
+			}
+		});
+	}
+
+	request(prompt: string, state: ClaudeRequestState) {
+		this.queue.push({ prompt, state });
+		this.pump();
+		return state.stream;
+	}
+
+	stop(): void {
+		this.stopped = true;
+		if (this.idleTimer) clearTimeout(this.idleTimer);
+		try {
+			this.child.kill("SIGTERM");
+		} catch {
+			/* noop */
+		}
+	}
+
+	private onStdout(chunk: string): void {
+		this.lineBuffer += chunk;
+		let newlineIndex = this.lineBuffer.indexOf("\n");
+		while (newlineIndex !== -1) {
+			const line = this.lineBuffer.slice(0, newlineIndex);
+			this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
+			const parsed = parseJsonLine(line);
+			if (parsed && this.pending?.state.handleEvent(parsed)) {
+				this.pending.state.finish();
+				this.pending = undefined;
+				markClaudeSessionWorker(this.stickySession, this.child.pid, "idle");
+				this.scheduleIdleStop();
+				this.pump();
+			}
+			newlineIndex = this.lineBuffer.indexOf("\n");
+		}
+	}
+
+	private pump(): void {
+		if (this.pending || this.queue.length === 0) return;
+		if (this.idleTimer) clearTimeout(this.idleTimer);
+		this.pending = this.queue.shift();
+		markClaudeSessionWorker(this.stickySession, this.child.pid, "running");
+		this.child.stdin?.write(claudeUserInputJsonl(this.pending?.prompt ?? ""));
+	}
+
+	private scheduleIdleStop(): void {
+		if (this.queue.length > 0 || this.pending) return;
+		const ttl = positiveEnvInt("PI_CLAUDE_CLI_WORKER_TTL_MS") ?? 20 * 60 * 1000;
+		this.idleTimer = setTimeout(() => this.stop(), ttl);
+	}
+
+	private failAll(message: string): void {
+		this.pending?.state.fail("error", message);
+		this.pending = undefined;
+		for (const item of this.queue.splice(0)) item.state.fail("error", message);
+		claudeWorkers.delete(this.stickySession.sessionKey);
+		markClaudeSessionWorker(this.stickySession, undefined, "error");
+	}
+}
+
+function runClaudeCli(model: Model<"claude-cli">, context: Context, options?: StreamOptions) {
+	const stickySession = claudeSessionReuseDisabled(options)
+		? createEphemeralClaudeSession(model, context, options)
+		: getStickySession(model, context, options);
+	if (stickySession && !stickySession.ephemeral && claudeWorkersEnabled()) {
+		const prompt = extractPrompt(context, stickySession);
+		const nextSeenMessageCount = latestUserIndex(context) + 2;
+		try {
+			let worker = claudeWorkers.get(stickySession.sessionKey);
+			if (!worker) {
+				worker = new ClaudeWorker(model, context, stickySession);
+				claudeWorkers.set(stickySession.sessionKey, worker);
+			}
+			const state = createWorkerRequestState({
+				model,
+				options,
+				stickySession,
+				nextSeenMessageCount,
+				terminateWorker: () => worker?.stop(),
+			});
+			return worker.request(prompt, state);
+		} catch (err) {
+			appendClaudeSessionTelemetry(stickySession, "worker-start-failed", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			claudeWorkers.delete(stickySession.sessionKey);
+		}
+	}
+	return runClaudeCliOneShot(model, context, options, stickySession);
+}
+
+function runClaudeCliOneShot(
 	model: Model<"claude-cli">,
 	context: Context,
-	options?: { signal?: AbortSignal; timeoutMs?: number },
+	options?: StreamOptions,
+	stickySession = claudeSessionReuseDisabled(options)
+		? createEphemeralClaudeSession(model, context, options)
+		: getStickySession(model, context, options),
 ) {
 	const stream = createAssistantMessageEventStream();
-	const stickySession = getStickySession(model, context);
 	const prompt = extractPrompt(context, stickySession);
 	const nextSeenMessageCount = latestUserIndex(context) + 2;
 	const idleTimeoutMs = resolveIdleTimeoutMs(options?.timeoutMs);
@@ -433,16 +1128,16 @@ function runClaudeCli(
 
 	const home = process.env.HOME ?? "/root";
 	const invocation = buildClaudeInvocation(model, context, prompt, stickySession);
+	if (stickySession)
+		appendClaudeSessionTelemetry(stickySession, stickySession.turns === 0 ? "start-new" : "resume-one-shot");
 	let child: ReturnType<typeof spawn>;
 	try {
 		child = spawn("claude", invocation.args, {
 			env: childEnv,
 			cwd: `${home}/projects/ahlnos`,
-			stdio: [invocation.stdinPrompt === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 		});
-		if (invocation.stdinPrompt !== undefined) {
-			child.stdin?.end(invocation.stdinPrompt);
-		}
+		child.stdin?.end(invocation.stdinPayload);
 		activeChildren.add(child);
 	} catch (spawnErr) {
 		cleanupClaudeArgTempFiles(invocation.tempFiles);
@@ -664,8 +1359,17 @@ function runClaudeCli(
 			if (typeof event.result === "string") finalText = event.result;
 			finalUsage = usageFromClaudeResult(event);
 			if (stickySession) {
-				stickySession.turns += 1;
-				stickySession.seenMessageCount = nextSeenMessageCount;
+				if (!stickySession.ephemeral) {
+					stickySession.turns += 1;
+					stickySession.seenMessageCount = nextSeenMessageCount;
+					stickySession.reuseStatus = "resume";
+					upsertClaudeSessionRegistry(stickySession, "ok");
+				}
+				appendClaudeSessionTelemetry(stickySession, "result", {
+					response_model: responseModel,
+					usage_input_tokens: finalUsage?.input,
+					usage_output_tokens: finalUsage?.output,
+				});
 			}
 		}
 	};
@@ -725,7 +1429,7 @@ function runClaudeCli(
 		}
 
 		if (maxRuntimeTimedOut) {
-			if (stickySession && sawClaudeSessionActivity && stickySession.turns === 0) {
+			if (stickySession && !stickySession.ephemeral && sawClaudeSessionActivity && stickySession.turns === 0) {
 				stickySession.turns = 1;
 				stickySession.seenMessageCount = nextSeenMessageCount;
 			}
@@ -745,6 +1449,20 @@ function runClaudeCli(
 
 		if (code !== 0) {
 			const errMsg = stderr.trim() || `claude -p exited with code ${code}`;
+			if (stickySession) {
+				if (
+					!stickySession.ephemeral &&
+					/Session ID .* is already in use|No conversation found|not found|invalid session/i.test(errMsg)
+				) {
+					stickySessions.delete(stickySession.sessionKey);
+					stickySession.reuseStatus = "stale-recreated";
+					stickySession.turns = 0;
+					stickySession.seenMessageCount = 0;
+					stickySession.sessionId = uuidFromKey(`pi-claude-cli\n${stickySession.sessionKey}\n${Date.now()}`);
+				}
+				upsertClaudeSessionRegistry(stickySession, "error");
+				appendClaudeSessionTelemetry(stickySession, "error", { error: errMsg });
+			}
 			const errMessage = buildAssistantMessage(
 				model,
 				finalText || displayText || stdout,
