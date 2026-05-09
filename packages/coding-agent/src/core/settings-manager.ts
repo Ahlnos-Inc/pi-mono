@@ -143,7 +143,7 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 	return result;
 }
 
-export type SettingsScope = "global" | "project";
+export type SettingsScope = "global" | "project" | "local";
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
@@ -157,10 +157,17 @@ export interface SettingsError {
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
 	private projectSettingsPath: string;
+	// Per-machine overlay file. Read-only from pi's perspective: SettingsManager
+	// writes always target "global" or "project". The "local" scope exists so
+	// machine-specific overrides (e.g. defaultModel/intelliSearchModel/packages
+	// for a single device) can sit alongside the tracked agent/settings.json
+	// without leaking back into the shared file when pi's UI mutates settings.
+	private localSettingsPath: string;
 
 	constructor(cwd: string, agentDir: string) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+		this.localSettingsPath = join(agentDir, "settings.local.json");
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -191,6 +198,17 @@ export class FileSettingsStorage implements SettingsStorage {
 	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
+		// "local" is a read-only overlay (settings.local.json) — pi never writes it back.
+		// We still call fn() so callers get a chance to read content; any returned write
+		// payload is discarded silently. See SettingsManager.save()/saveProjectSettings()
+		// — neither targets "local", so under normal operation no write payload is
+		// produced for this scope anyway.
+		if (scope === "local") {
+			const current = existsSync(this.localSettingsPath) ? readFileSync(this.localSettingsPath, "utf-8") : undefined;
+			fn(current);
+			return;
+		}
+
 		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
 		const dir = dirname(path);
 
@@ -224,8 +242,16 @@ export class FileSettingsStorage implements SettingsStorage {
 export class InMemorySettingsStorage implements SettingsStorage {
 	private global: string | undefined;
 	private project: string | undefined;
+	// Mirrors FileSettingsStorage: "local" is a read-only overlay. Tests can seed
+	// it via setLocal() but pi's normal write paths never target this scope.
+	private local: string | undefined;
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
+		if (scope === "local") {
+			fn(this.local);
+			return;
+		}
+
 		const current = scope === "global" ? this.global : this.project;
 		const next = fn(current);
 		if (next !== undefined) {
@@ -236,12 +262,18 @@ export class InMemorySettingsStorage implements SettingsStorage {
 			}
 		}
 	}
+
+	/** Test-only helper: seed the read-only "local" overlay. */
+	setLocal(content: string | undefined): void {
+		this.local = content;
+	}
 }
 
 export class SettingsManager {
 	private storage: SettingsStorage;
 	private globalSettings: Settings;
 	private projectSettings: Settings;
+	private localSettings: Settings; // Read-only per-machine overlay (settings.local.json)
 	private settings: Settings;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -249,6 +281,9 @@ export class SettingsManager {
 	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
 	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
+	// Note: no localSettingsLoadError field — the local overlay is read-only,
+	// so there is no save-time gate to skip. Parse errors flow into `this.errors`
+	// via recordError("local", ...) and surface to callers through drainErrors().
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
 
@@ -256,6 +291,7 @@ export class SettingsManager {
 		storage: SettingsStorage,
 		initialGlobal: Settings,
 		initialProject: Settings,
+		initialLocal: Settings,
 		globalLoadError: Error | null = null,
 		projectLoadError: Error | null = null,
 		initialErrors: SettingsError[] = [],
@@ -263,10 +299,14 @@ export class SettingsManager {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;
 		this.projectSettings = initialProject;
+		this.localSettings = initialLocal;
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.localSettings,
+		);
 	}
 
 	/** Create a SettingsManager that loads from files */
@@ -279,6 +319,7 @@ export class SettingsManager {
 	static fromStorage(storage: SettingsStorage): SettingsManager {
 		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global");
 		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project");
+		const localLoad = SettingsManager.tryLoadFromStorage(storage, "local");
 		const initialErrors: SettingsError[] = [];
 		if (globalLoad.error) {
 			initialErrors.push({ scope: "global", error: globalLoad.error });
@@ -286,11 +327,15 @@ export class SettingsManager {
 		if (projectLoad.error) {
 			initialErrors.push({ scope: "project", error: projectLoad.error });
 		}
+		if (localLoad.error) {
+			initialErrors.push({ scope: "local", error: localLoad.error });
+		}
 
 		return new SettingsManager(
 			storage,
 			globalLoad.settings,
 			projectLoad.settings,
+			localLoad.settings,
 			globalLoad.error,
 			projectLoad.error,
 			initialErrors,
@@ -400,6 +445,11 @@ export class SettingsManager {
 		return structuredClone(this.projectSettings);
 	}
 
+	/** Snapshot of the loaded settings.local.json overlay (read-only). */
+	getLocalSettings(): Settings {
+		return structuredClone(this.localSettings);
+	}
+
 	async reload(): Promise<void> {
 		await this.writeQueue;
 		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
@@ -425,7 +475,17 @@ export class SettingsManager {
 			this.recordError("project", projectLoad.error);
 		}
 
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		const localLoad = SettingsManager.tryLoadFromStorage(this.storage, "local");
+		if (!localLoad.error) {
+			this.localSettings = localLoad.settings;
+		} else {
+			this.recordError("local", localLoad.error);
+		}
+
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.localSettings,
+		);
 	}
 
 	/** Apply additional overrides on top of current settings */
@@ -522,7 +582,10 @@ export class SettingsManager {
 	}
 
 	private save(): void {
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.localSettings,
+		);
 
 		if (this.globalSettingsLoadError) {
 			return;
@@ -539,7 +602,10 @@ export class SettingsManager {
 
 	private saveProjectSettings(settings: Settings): void {
 		this.projectSettings = structuredClone(settings);
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.localSettings,
+		);
 
 		if (this.projectSettingsLoadError) {
 			return;
