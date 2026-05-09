@@ -219,6 +219,56 @@ describe("SettingsManager", () => {
 			});
 			expect(manager.getDefaultModel()).toBe("local-model");
 		});
+
+		it("should keep local overlay masked values in memory while persisting same-key UI changes to tracked settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const localSettingsPath = join(agentDir, "settings.local.json");
+			writeFileSync(settingsPath, JSON.stringify({ defaultModel: "shared-model" }));
+			writeFileSync(localSettingsPath, JSON.stringify({ defaultModel: "local-model" }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setDefaultModel("new-shared-model");
+			await manager.flush();
+
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8")).defaultModel).toBe("new-shared-model");
+			expect(JSON.parse(readFileSync(localSettingsPath, "utf-8")).defaultModel).toBe("local-model");
+			expect(manager.getDefaultModel()).toBe("local-model");
+		});
+
+		it("should surface malformed local overlays without poisoning runtime settings", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+			writeFileSync(join(agentDir, "settings.local.json"), "{ invalid global local json");
+			writeFileSync(join(projectDir, ".pi", "settings.local.json"), "{ invalid project local json");
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getTheme()).toBe("dark");
+			const errors = manager.drainErrors();
+			expect(errors.map((e) => e.scope).sort()).toEqual(["globalLocal", "projectLocal"]);
+		});
+
+		it("should reload settings.local.json changes from disk", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultModel: "shared-model" }));
+			writeFileSync(join(agentDir, "settings.local.json"), JSON.stringify({ defaultModel: "first-local" }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getDefaultModel()).toBe("first-local");
+
+			writeFileSync(join(agentDir, "settings.local.json"), JSON.stringify({ defaultModel: "second-local" }));
+			await manager.reload();
+
+			expect(manager.getDefaultModel()).toBe("second-local");
+		});
+
+		it("should migrate legacy keys from local overlays", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({}));
+			writeFileSync(join(agentDir, "settings.local.json"), JSON.stringify({ queueMode: "all" }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getSteeringMode()).toBe("all");
+			expect(manager.getGlobalLocalSettings()).toEqual({ steeringMode: "all" });
+		});
 	});
 
 	describe("reload", () => {
