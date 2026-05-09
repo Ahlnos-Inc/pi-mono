@@ -26,6 +26,11 @@ import {
 	serializeConversation,
 } from "./utils.js";
 
+const COMPACTION_COMPLETION_METADATA = {
+	disableClaudeSessionReuse: true,
+	sessionPurpose: "compaction",
+} as const;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -324,7 +329,7 @@ export async function generateBranchSummary(
 	const response = await completeSimple(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ apiKey, headers, signal, maxTokens: 2048 },
+		{ apiKey, headers, signal, maxTokens: 2048, metadata: COMPACTION_COMPLETION_METADATA },
 	);
 
 	// Check if aborted or errored

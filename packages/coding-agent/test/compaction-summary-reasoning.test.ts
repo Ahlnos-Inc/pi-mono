@@ -73,6 +73,10 @@ describe("generateSummary reasoning options", () => {
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
 			reasoning: "medium",
 			apiKey: "test-key",
+			metadata: {
+				disableClaudeSessionReuse: true,
+				sessionPurpose: "compaction",
+			},
 		});
 	});
 

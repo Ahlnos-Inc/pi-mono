@@ -25,6 +25,11 @@ import {
 	serializeConversation,
 } from "./utils.js";
 
+const COMPACTION_COMPLETION_METADATA = {
+	disableClaudeSessionReuse: true,
+	sessionPurpose: "compaction",
+} as const;
+
 // ============================================================================
 // File Operation Tracking
 // ============================================================================
@@ -602,8 +607,8 @@ export async function generateSummary(
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
+			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel, metadata: COMPACTION_COMPLETION_METADATA }
+			: { maxTokens, signal, apiKey, headers, metadata: COMPACTION_COMPLETION_METADATA };
 
 	const response = await completeSimple(
 		model,
@@ -862,8 +867,8 @@ async function generateTurnPrefixSummary(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
+			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel, metadata: COMPACTION_COMPLETION_METADATA }
+			: { maxTokens, signal, apiKey, headers, metadata: COMPACTION_COMPLETION_METADATA },
 	);
 
 	if (response.stopReason === "error") {

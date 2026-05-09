@@ -21,6 +21,7 @@ function createSession(options: {
 	thinkingLevel?: string;
 	usage?: AssistantUsage;
 	contextUsage?: { contextWindow: number; percent: number | null };
+	agentChosen?: string | null;
 }): AgentSession {
 	const usage = options.usage;
 	const entries =
@@ -32,6 +33,19 @@ function createSession(options: {
 						message: {
 							role: "assistant",
 							usage,
+						},
+					},
+				];
+	const branch =
+		options.agentChosen === undefined
+			? entries
+			: [
+					...entries,
+					{
+						type: "custom",
+						customType: "pi-router/decision",
+						data: {
+							agent_chosen: options.agentChosen,
 						},
 					},
 				];
@@ -48,6 +62,7 @@ function createSession(options: {
 		},
 		sessionManager: {
 			getEntries: () => entries,
+			getBranch: () => branch,
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
@@ -127,5 +142,31 @@ describe("FooterComponent width handling", () => {
 		const outputWithUnknownUsage = footerWithUnknownUsage.render(120).join("\n");
 		expect(outputWithUnknownUsage).toContain("?/200k");
 		expect(outputWithUnknownUsage).not.toContain("0.0%/200k");
+	});
+
+	it("shows the current agency agent from the latest router decision", () => {
+		const footer = new FooterComponent(
+			createSession({
+				sessionName: "",
+				agentChosen: "agency/engineering/engineering-devops-automator",
+			}),
+			createFooterData(1),
+		);
+
+		const output = footer.render(120).join("\n");
+		expect(output).toContain("agent:engineering/devops-automator");
+	});
+
+	it("shows agent:none when the latest router decision has no agency agent", () => {
+		const footer = new FooterComponent(
+			createSession({
+				sessionName: "",
+				agentChosen: null,
+			}),
+			createFooterData(1),
+		);
+
+		const output = footer.render(120).join("\n");
+		expect(output).toContain("agent:none");
 	});
 });

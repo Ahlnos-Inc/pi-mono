@@ -26,6 +26,33 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+function formatAgencyAgent(agentPath: string | null | undefined): string | null {
+	if (agentPath === undefined) return null;
+	if (agentPath === null || agentPath.trim() === "") return "agent:none";
+
+	const parts = agentPath.split("/").filter(Boolean);
+	const division = parts.length >= 3 && parts[0] === "agency" ? parts[1] : undefined;
+	const rawName = parts.at(-1) ?? agentPath;
+	const name = division && rawName.startsWith(`${division}-`) ? rawName.slice(division.length + 1) : rawName;
+
+	return division ? `agent:${division}/${name}` : `agent:${name}`;
+}
+
+function getCurrentAgencyAgent(session: AgentSession): string | null {
+	const branch = session.sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type !== "custom" || entry.customType !== "pi-router/decision") continue;
+
+		const data = entry.data as { agent_chosen?: string | null; agentChosen?: string | null } | undefined;
+		if (!data) return "agent:none";
+
+		return formatAgencyAgent(data.agent_chosen ?? data.agentChosen ?? null) ?? "agent:none";
+	}
+
+	return null;
+}
+
 /**
  * Footer component that shows pwd, token stats, and context usage.
  * Computes token/context stats from session, gets git branch and extension statuses from provider.
@@ -142,6 +169,7 @@ export class FooterComponent implements Component {
 
 		// Add model name on the right side, plus thinking level if model supports it
 		const modelName = state.model?.id || "no-model";
+		const currentAgencyAgent = getCurrentAgencyAgent(this.session);
 
 		let statsLeftWidth = visibleWidth(statsLeft);
 
@@ -160,6 +188,9 @@ export class FooterComponent implements Component {
 			const thinkingLevel = state.thinkingLevel || "off";
 			rightSideWithoutProvider =
 				thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+		}
+		if (currentAgencyAgent) {
+			rightSideWithoutProvider = `${currentAgencyAgent} • ${rightSideWithoutProvider}`;
 		}
 
 		// Prepend the provider in parentheses if there are multiple providers and there's enough room
