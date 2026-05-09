@@ -734,6 +734,11 @@ function activityLine(text: string): string {
 	return `[claude-cli] ${text}\n`;
 }
 
+function textBlockBoundary(text: string): string {
+	if (text.trim().length === 0) return "";
+	return text.endsWith("\n") ? "" : "\n\n";
+}
+
 type ClaudeRequestState = {
 	stream: ReturnType<typeof createAssistantMessageEventStream>;
 	handleEvent: (event: ClaudeCliJson) => boolean;
@@ -867,7 +872,11 @@ function createWorkerRequestState(input: {
 				const blockType = typeof block?.type === "string" ? block.type : "unknown";
 				if (blockType === "text") {
 					blocks.set(index, { type: "text", text: "" });
-					if (!finalText && displayText) updateDisplay("", "");
+					const boundary = textBlockBoundary(finalText);
+					if (boundary) {
+						finalText += boundary;
+						updateDisplay(finalText, boundary);
+					} else if (!finalText && displayText) updateDisplay("", "");
 				} else if (blockType === "tool_use") {
 					const toolName = typeof block?.name === "string" ? block.name : "tool";
 					blocks.set(index, {
@@ -937,7 +946,7 @@ function createWorkerRequestState(input: {
 		}
 
 		if (event.type === "result") {
-			if (typeof event.result === "string") finalText = event.result;
+			if (typeof event.result === "string" && finalText.length === 0) finalText = event.result;
 			finalUsage = usageFromClaudeResult(event);
 			input.stickySession.turns += 1;
 			input.stickySession.seenMessageCount = input.nextSeenMessageCount;
@@ -1283,7 +1292,11 @@ function runClaudeCliOneShot(
 				const blockType = typeof block?.type === "string" ? block.type : "unknown";
 				if (blockType === "text") {
 					blocks.set(index, { type: "text", text: "" });
-					if (!finalText && displayText) updateDisplay("", "");
+					const boundary = textBlockBoundary(finalText);
+					if (boundary) {
+						finalText += boundary;
+						updateDisplay(finalText, boundary);
+					} else if (!finalText && displayText) updateDisplay("", "");
 				} else if (blockType === "thinking") {
 					blocks.set(index, { type: "thinking", text: "" });
 				} else if (blockType === "tool_use") {
@@ -1362,7 +1375,7 @@ function runClaudeCliOneShot(
 
 		if (event.type === "result") {
 			sawClaudeSessionActivity = true;
-			if (typeof event.result === "string") finalText = event.result;
+			if (typeof event.result === "string" && finalText.length === 0) finalText = event.result;
 			finalUsage = usageFromClaudeResult(event);
 			if (stickySession) {
 				if (!stickySession.ephemeral) {

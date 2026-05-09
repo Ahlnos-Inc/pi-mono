@@ -729,4 +729,100 @@ describe("claude-cli provider", () => {
 		if (done?.type !== "done") throw new Error("Expected done event");
 		expect(done.message.content).toEqual([{ type: "text", text: "/tmp" }]);
 	});
+
+	it("preserves paragraph breaks between text blocks separated by Claude tool use", async () => {
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		const stream = streamClaudeCli(model, context(), {});
+		const eventsPromise = collectEvents(stream);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Before tool:" } },
+			},
+			{ type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_start",
+					index: 1,
+					content_block: { type: "tool_use", id: "toolu_1", name: "Bash" },
+				},
+			},
+			{ type: "stream_event", event: { type: "content_block_stop", index: 1 } },
+			{ type: "user", tool_use_result: { stdout: "ok", is_error: false } },
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "After tool." } },
+			},
+			{
+				type: "result",
+				subtype: "success",
+				result: "Before tool:After tool.",
+				usage: { input_tokens: 1, output_tokens: 1 },
+			},
+		]);
+		child.emit("close", 0);
+
+		const events = await eventsPromise;
+		const done = events.find((event) => event.type === "done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "Before tool:\n\nAfter tool." }]);
+	});
+
+	it("preserves paragraph breaks between text blocks in long-lived Claude workers", async () => {
+		process.env.PI_CLAUDE_CLI_WORKERS = "1";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		const stream = streamClaudeCli(model, context(), {});
+		const eventsPromise = collectEvents(stream);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "First:" } },
+			},
+			{ type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Read" } },
+			},
+			{ type: "stream_event", event: { type: "content_block_stop", index: 1 } },
+			{ type: "user", tool_use_result: { stdout: "ok", is_error: false } },
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "Second." } },
+			},
+			{
+				type: "result",
+				subtype: "success",
+				result: "First:Second.",
+				usage: { input_tokens: 1, output_tokens: 1 },
+			},
+		]);
+
+		const events = await eventsPromise;
+		const done = events.find((event) => event.type === "done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "First:\n\nSecond." }]);
+	});
 });
