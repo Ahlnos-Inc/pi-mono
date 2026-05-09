@@ -38,4 +38,6 @@ todo.md
 plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
+.pi/settings.local.json
+.pi/**/settings.local.json
 collect.sh

@@ -155,6 +155,72 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("settings.local.json overlays", () => {
+		it("should merge global and project local overlays after tracked settings", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					theme: "shared",
+					defaultProvider: "shared-provider",
+					terminal: { showImages: true, imageWidthCells: 40 },
+					enabledModels: ["shared-a", "shared-b"],
+				}),
+			);
+			writeFileSync(
+				join(agentDir, "settings.local.json"),
+				JSON.stringify({
+					defaultProvider: "local-provider",
+					terminal: { imageWidthCells: 80 },
+					enabledModels: ["local-only"],
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".pi", "settings.json"),
+				JSON.stringify({
+					defaultModel: "project-model",
+					terminal: { showImages: false },
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".pi", "settings.local.json"),
+				JSON.stringify({
+					defaultModel: "project-local-model",
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getTheme()).toBe("shared");
+			expect(manager.getDefaultProvider()).toBe("local-provider");
+			expect(manager.getDefaultModel()).toBe("project-local-model");
+			expect(manager.getImageWidthCells()).toBe(80);
+			expect(manager.getShowImages()).toBe(false);
+			expect(manager.getEnabledModels()).toEqual(["local-only"]);
+		});
+
+		it("should not leak local overlay values into tracked settings when saving unrelated fields", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const localSettingsPath = join(agentDir, "settings.local.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "shared" }));
+			writeFileSync(
+				localSettingsPath,
+				JSON.stringify({ defaultModel: "local-model", enabledModels: ["local-only"] }),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setDefaultThinkingLevel("high");
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings).toEqual({ theme: "shared", defaultThinkingLevel: "high" });
+			expect(JSON.parse(readFileSync(localSettingsPath, "utf-8"))).toEqual({
+				defaultModel: "local-model",
+				enabledModels: ["local-only"],
+			});
+			expect(manager.getDefaultModel()).toBe("local-model");
+		});
+	});
+
 	describe("reload", () => {
 		it("should reload global settings from disk", async () => {
 			const settingsPath = join(agentDir, "settings.json");

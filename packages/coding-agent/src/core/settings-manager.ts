@@ -143,7 +143,7 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 	return result;
 }
 
-export type SettingsScope = "global" | "project";
+export type SettingsScope = "global" | "globalLocal" | "project" | "projectLocal";
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
@@ -156,11 +156,15 @@ export interface SettingsError {
 
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
+	private globalLocalSettingsPath: string;
 	private projectSettingsPath: string;
+	private projectLocalSettingsPath: string;
 
 	constructor(cwd: string, agentDir: string) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
+		this.globalLocalSettingsPath = join(agentDir, "settings.local.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+		this.projectLocalSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.local.json");
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -191,7 +195,14 @@ export class FileSettingsStorage implements SettingsStorage {
 	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
-		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		const path =
+			scope === "global"
+				? this.globalSettingsPath
+				: scope === "globalLocal"
+					? this.globalLocalSettingsPath
+					: scope === "project"
+						? this.projectSettingsPath
+						: this.projectLocalSettingsPath;
 		const dir = dirname(path);
 
 		let release: (() => void) | undefined;
@@ -222,18 +233,12 @@ export class FileSettingsStorage implements SettingsStorage {
 }
 
 export class InMemorySettingsStorage implements SettingsStorage {
-	private global: string | undefined;
-	private project: string | undefined;
+	private values: Partial<Record<SettingsScope, string>> = {};
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
-		const current = scope === "global" ? this.global : this.project;
-		const next = fn(current);
+		const next = fn(this.values[scope]);
 		if (next !== undefined) {
-			if (scope === "global") {
-				this.global = next;
-			} else {
-				this.project = next;
-			}
+			this.values[scope] = next;
 		}
 	}
 }
@@ -241,32 +246,41 @@ export class InMemorySettingsStorage implements SettingsStorage {
 export class SettingsManager {
 	private storage: SettingsStorage;
 	private globalSettings: Settings;
+	private globalLocalSettings: Settings;
 	private projectSettings: Settings;
+	private projectLocalSettings: Settings;
 	private settings: Settings;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
 	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
-	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
-	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
+	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors (gates global writeback)
+	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors (gates project writeback)
+	// Local-overlay parse errors are not tracked here because local files are
+	// never written to by the manager; load errors are surfaced via `errors`
+	// (see recordError("globalLocal"|"projectLocal", ...) in reload()).
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
 
 	private constructor(
 		storage: SettingsStorage,
 		initialGlobal: Settings,
+		initialGlobalLocal: Settings,
 		initialProject: Settings,
+		initialProjectLocal: Settings,
 		globalLoadError: Error | null = null,
 		projectLoadError: Error | null = null,
 		initialErrors: SettingsError[] = [],
 	) {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;
+		this.globalLocalSettings = initialGlobalLocal;
 		this.projectSettings = initialProject;
+		this.projectLocalSettings = initialProjectLocal;
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeAllSettings();
 	}
 
 	/** Create a SettingsManager that loads from files */
@@ -278,19 +292,27 @@ export class SettingsManager {
 	/** Create a SettingsManager from an arbitrary storage backend */
 	static fromStorage(storage: SettingsStorage): SettingsManager {
 		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global");
+		const globalLocalLoad = SettingsManager.tryLoadFromStorage(storage, "globalLocal");
 		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project");
+		const projectLocalLoad = SettingsManager.tryLoadFromStorage(storage, "projectLocal");
 		const initialErrors: SettingsError[] = [];
-		if (globalLoad.error) {
-			initialErrors.push({ scope: "global", error: globalLoad.error });
-		}
-		if (projectLoad.error) {
-			initialErrors.push({ scope: "project", error: projectLoad.error });
+		for (const [scope, load] of [
+			["global", globalLoad],
+			["globalLocal", globalLocalLoad],
+			["project", projectLoad],
+			["projectLocal", projectLocalLoad],
+		] as const) {
+			if (load.error) {
+				initialErrors.push({ scope, error: load.error });
+			}
 		}
 
 		return new SettingsManager(
 			storage,
 			globalLoad.settings,
+			globalLocalLoad.settings,
 			projectLoad.settings,
+			projectLocalLoad.settings,
 			globalLoad.error,
 			projectLoad.error,
 			initialErrors,
@@ -392,12 +414,27 @@ export class SettingsManager {
 		return settings as Settings;
 	}
 
+	private mergeAllSettings(): Settings {
+		return deepMergeSettings(
+			deepMergeSettings(deepMergeSettings(this.globalSettings, this.globalLocalSettings), this.projectSettings),
+			this.projectLocalSettings,
+		);
+	}
+
 	getGlobalSettings(): Settings {
 		return structuredClone(this.globalSettings);
 	}
 
+	getGlobalLocalSettings(): Settings {
+		return structuredClone(this.globalLocalSettings);
+	}
+
 	getProjectSettings(): Settings {
 		return structuredClone(this.projectSettings);
+	}
+
+	getProjectLocalSettings(): Settings {
+		return structuredClone(this.projectLocalSettings);
 	}
 
 	async reload(): Promise<void> {
@@ -409,6 +446,13 @@ export class SettingsManager {
 		} else {
 			this.globalSettingsLoadError = globalLoad.error;
 			this.recordError("global", globalLoad.error);
+		}
+
+		const globalLocalLoad = SettingsManager.tryLoadFromStorage(this.storage, "globalLocal");
+		if (!globalLocalLoad.error) {
+			this.globalLocalSettings = globalLocalLoad.settings;
+		} else {
+			this.recordError("globalLocal", globalLocalLoad.error);
 		}
 
 		this.modifiedFields.clear();
@@ -425,9 +469,15 @@ export class SettingsManager {
 			this.recordError("project", projectLoad.error);
 		}
 
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
-	}
+		const projectLocalLoad = SettingsManager.tryLoadFromStorage(this.storage, "projectLocal");
+		if (!projectLocalLoad.error) {
+			this.projectLocalSettings = projectLocalLoad.settings;
+		} else {
+			this.recordError("projectLocal", projectLocalLoad.error);
+		}
 
+		this.settings = this.mergeAllSettings();
+	}
 	/** Apply additional overrides on top of current settings */
 	applyOverrides(overrides: Partial<Settings>): void {
 		this.settings = deepMergeSettings(this.settings, overrides);
@@ -522,7 +572,7 @@ export class SettingsManager {
 	}
 
 	private save(): void {
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeAllSettings();
 
 		if (this.globalSettingsLoadError) {
 			return;
@@ -539,7 +589,7 @@ export class SettingsManager {
 
 	private saveProjectSettings(settings: Settings): void {
 		this.projectSettings = structuredClone(settings);
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeAllSettings();
 
 		if (this.projectSettingsLoadError) {
 			return;
