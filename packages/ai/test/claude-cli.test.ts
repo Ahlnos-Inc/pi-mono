@@ -289,6 +289,46 @@ describe("claude-cli provider", () => {
 		expect(payloads[1]).toContain("Current question:\nagain");
 	});
 
+	it("keeps the worker alive on abort and reuses it for the next prompt (barge-in)", async () => {
+		process.env.PI_CLAUDE_CLI_WORKERS = "1";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(child);
+
+		const controller = new AbortController();
+		const firstStream = streamClaudeCli(model, context("same system"), { signal: controller.signal });
+		const firstEventsPromise = collectEvents(firstStream);
+		// Abort the in-flight turn — the worker MUST stay alive (no kill).
+		controller.abort();
+		const firstEvents = await firstEventsPromise;
+
+		expect(child.kill).not.toHaveBeenCalled();
+		const firstError = firstEvents.find((event) => event.type === "error");
+		expect(firstError?.type).toBe("error");
+
+		// Next prompt must reuse the same worker (no second spawn).
+		const secondMessages: Message[] = [
+			{ role: "user", content: "hello", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "" }], timestamp: 2 } as Message,
+			{ role: "user", content: "again", timestamp: 3 },
+		];
+		const secondStream = streamClaudeCli(model, contextWithMessages(secondMessages, "same system"), {});
+		const secondEventsPromise = collectEvents(secondStream);
+		// First the truncated `result` from the aborted turn arrives — it must be
+		// drained and ignored. Then the new turn's `result` resolves cleanly.
+		writeJsonl(child, [{ type: "result", subtype: "success", result: "discarded", usage: {} }]);
+		writeJsonl(child, [{ type: "result", subtype: "success", result: "second", usage: {} }]);
+		const secondEvents = await secondEventsPromise;
+
+		expect(spawnMock).toHaveBeenCalledTimes(1);
+		expect(child.kill).not.toHaveBeenCalled();
+		const done = secondEvents.find((event) => event.type === "done");
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "second" }]);
+		// Both prompts were sent to the same child stdin (barge-in delivered).
+		expect(userEnvelopePayloads(child)).toEqual(["hello", expect.stringContaining("again")]);
+	});
+
 	it("only sends inline prior Pi turns on the first sticky Claude call", () => {
 		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
 

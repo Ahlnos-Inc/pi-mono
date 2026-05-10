@@ -754,6 +754,7 @@ function createWorkerRequestState(input: {
 	stickySession: StickyClaudeSession;
 	nextSeenMessageCount: number;
 	terminateWorker: () => void;
+	markAborted?: () => void;
 }): ClaudeRequestState {
 	const stream = createAssistantMessageEventStream();
 	const idleTimeoutMs = resolveIdleTimeoutMs(input.options?.timeoutMs);
@@ -795,7 +796,11 @@ function createWorkerRequestState(input: {
 	}
 
 	const onAbort = () => {
-		input.terminateWorker();
+		// Soft-abort path: the worker stays alive and drains the in-flight turn so
+		// the next prompt can reuse the same OS process (no claude-cli cold start).
+		// Falls back to the legacy hard kill when the caller didn't wire markAborted.
+		if (input.markAborted) input.markAborted();
+		else input.terminateWorker();
 		fail("aborted", "claude-cli aborted");
 	};
 
@@ -994,6 +999,12 @@ class ClaudeWorker {
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private tempFiles: string[] = [];
 	private stopped = false;
+	// Each entry counts a turn that was aborted by the caller while still in
+	// flight on claude. We keep the worker alive and discard claude's events
+	// for those turns until their `result` event arrives, which lets the next
+	// queued prompt barge-in on the same OS process instead of paying a cold
+	// start. Decremented per `result` event observed in onStdout.
+	private drainResultsRemaining = 0;
 
 	constructor(
 		model: Model<"claude-cli">,
@@ -1057,7 +1068,16 @@ class ClaudeWorker {
 			const line = this.lineBuffer.slice(0, newlineIndex);
 			this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
 			const parsed = parseJsonLine(line);
-			if (parsed && this.pending?.state.handleEvent(parsed)) {
+			if (!parsed) {
+				newlineIndex = this.lineBuffer.indexOf("\n");
+				continue;
+			}
+			if (this.drainResultsRemaining > 0) {
+				if (parsed.type === "result") this.drainResultsRemaining -= 1;
+				newlineIndex = this.lineBuffer.indexOf("\n");
+				continue;
+			}
+			if (this.pending?.state.handleEvent(parsed)) {
 				this.pending.state.finish();
 				this.pending = undefined;
 				markClaudeSessionWorker(this.stickySession, this.child.pid, "idle");
@@ -1066,6 +1086,22 @@ class ClaudeWorker {
 			}
 			newlineIndex = this.lineBuffer.indexOf("\n");
 		}
+	}
+
+	abortPending(state: ClaudeRequestState): void {
+		if (this.pending?.state === state) {
+			// Active turn aborted: claude will eventually emit a `result` event for
+			// it (truncated when we send the next user event as a barge-in). Until
+			// that result arrives, every event in onStdout belongs to the aborted
+			// turn and must be discarded. Free the slot now so pump() can fire the
+			// next queued prompt as the barge-in trigger.
+			this.drainResultsRemaining += 1;
+			this.pending = undefined;
+			this.pump();
+			return;
+		}
+		const queuedIdx = this.queue.findIndex((item) => item.state === state);
+		if (queuedIdx !== -1) this.queue.splice(queuedIdx, 1);
 	}
 
 	private pump(): void {
@@ -1086,6 +1122,7 @@ class ClaudeWorker {
 		this.pending?.state.fail("error", message);
 		this.pending = undefined;
 		for (const item of this.queue.splice(0)) item.state.fail("error", message);
+		this.drainResultsRemaining = 0;
 		claudeWorkers.delete(this.stickySession.sessionKey);
 		markClaudeSessionWorker(this.stickySession, undefined, "error");
 	}
@@ -1104,12 +1141,13 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, options?: St
 				worker = new ClaudeWorker(model, context, stickySession);
 				claudeWorkers.set(stickySession.sessionKey, worker);
 			}
-			const state = createWorkerRequestState({
+			const state: ClaudeRequestState = createWorkerRequestState({
 				model,
 				options,
 				stickySession,
 				nextSeenMessageCount,
 				terminateWorker: () => worker?.stop(),
+				markAborted: () => worker?.abortPending(state),
 			});
 			return worker.request(prompt, state);
 		} catch (err) {
