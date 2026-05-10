@@ -4,6 +4,11 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import {
+	DEFAULT_TOOL_RESULT_GUARD_SUMMARIZE_OVER,
+	DEFAULT_TOOL_RESULT_GUARD_SUMMARY_MODEL,
+	type ToolResultGuardSettings,
+} from "./tool-result-guard.js";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -54,6 +59,11 @@ export interface MarkdownSettings {
 
 export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
+}
+
+export interface ToolResultGuardConfig {
+	summarizeOver?: number; // default: 8000 characters; <=0 disables
+	summaryModel?: string; // default: claude-cli/claude-haiku-4-5-20251001
 }
 
 export type TransportSetting = Transport;
@@ -109,6 +119,7 @@ export interface Settings {
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
+	toolResultGuard?: ToolResultGuardConfig;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 }
 
@@ -1107,6 +1118,13 @@ export class SettingsManager {
 
 	getWarnings(): WarningSettings {
 		return { ...(this.settings.warnings ?? {}) };
+	}
+
+	getToolResultGuardSettings(): ToolResultGuardSettings {
+		return {
+			summarizeOver: this.settings.toolResultGuard?.summarizeOver ?? DEFAULT_TOOL_RESULT_GUARD_SUMMARIZE_OVER,
+			summaryModel: this.settings.toolResultGuard?.summaryModel ?? DEFAULT_TOOL_RESULT_GUARD_SUMMARY_MODEL,
+		};
 	}
 
 	setWarnings(warnings: WarningSettings): void {

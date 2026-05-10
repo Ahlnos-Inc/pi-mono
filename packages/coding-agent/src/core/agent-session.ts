@@ -27,6 +27,7 @@ import type { AssistantMessage, ImageContent, Message, Model, TextContent } from
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	completeSimple,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
@@ -78,16 +79,25 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { parseModelPattern } from "./model-resolver.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
+import { SessionBlobStore } from "./session-blob-store.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.js";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
 import type { SlashCommandInfo } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
+import {
+	DEFAULT_TOOL_RESULT_GUARD_SUMMARY_MODEL,
+	guardBashResult,
+	guardToolResultContent,
+} from "./tool-result-guard.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
+import { createLoadSkillToolDefinition } from "./tools/load-skill.js";
+import { createReadBlobToolDefinition } from "./tools/read-blob.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 
 // ============================================================================
@@ -236,6 +246,8 @@ interface ToolDefinitionEntry {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const TOOL_RESULT_SUMMARY_SYSTEM_PROMPT =
+	"Summarize tool output for a coding agent. Preserve exact errors, file paths, commands, counts, and next actions. Be concise.";
 
 // ============================================================================
 // AgentSession Class
@@ -286,6 +298,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _blobStore: SessionBlobStore;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -318,6 +331,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._blobStore = new SessionBlobStore(config.sessionManager);
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -401,30 +415,131 @@ export class AgentSession {
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
 			const runner = this._extensionRunner;
-			if (!runner.hasHandlers("tool_result")) {
-				return undefined;
+			let content = result.content;
+			let details = result.details;
+			let finalIsError = isError;
+			let modified = false;
+
+			if (runner.hasHandlers("tool_result")) {
+				const hookResult = await runner.emitToolResult({
+					type: "tool_result",
+					toolName: toolCall.name,
+					toolCallId: toolCall.id,
+					input: args as Record<string, unknown>,
+					content,
+					details,
+					isError: finalIsError,
+				});
+
+				if (hookResult) {
+					content = hookResult.content ?? content;
+					details = hookResult.details;
+					finalIsError = hookResult.isError ?? finalIsError;
+					modified = true;
+				}
 			}
 
-			const hookResult = await runner.emitToolResult({
-				type: "tool_result",
-				toolName: toolCall.name,
-				toolCallId: toolCall.id,
-				input: args as Record<string, unknown>,
-				content: result.content,
-				details: result.details,
-				isError,
-			});
-
-			if (!hookResult) {
-				return undefined;
+			const guarded = await this._guardToolResult(toolCall.name, content, details);
+			if (guarded) {
+				content = guarded.content;
+				details = guarded.details;
+				modified = true;
 			}
 
+			if (!modified) {
+				return undefined;
+			}
 			return {
-				content: hookResult.content,
-				details: hookResult.details,
-				isError: hookResult.isError ?? isError,
+				content,
+				details,
+				isError: finalIsError,
 			};
 		};
+	}
+
+	private async _guardToolResult(
+		toolName: string,
+		content: Array<TextContent | ImageContent>,
+		details: unknown,
+	): Promise<{ content: Array<TextContent | ImageContent>; details: unknown } | undefined> {
+		if (toolName === "LoadSkill" || toolName === "ReadBlob") {
+			return undefined;
+		}
+
+		const settings = this.settingsManager.getToolResultGuardSettings();
+		const guarded = await guardToolResultContent({
+			toolName,
+			content,
+			details,
+			settings,
+			blobStore: this._blobStore,
+			summarize: (text, metadata) => this._summarizeToolResultText(text, metadata),
+		});
+
+		if (!guarded) {
+			return undefined;
+		}
+
+		return { content: guarded.content, details: guarded.details };
+	}
+
+	private async _summarizeToolResultText(
+		text: string,
+		metadata: { toolName: string; originalChars: number },
+	): Promise<string> {
+		const model = await this._resolveToolResultSummaryModel();
+		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const prompt = [
+			`Tool: ${metadata.toolName}`,
+			`Original size: ${metadata.originalChars} characters`,
+			"",
+			"<tool-output>",
+			text,
+			"</tool-output>",
+			"",
+			"Return a compact summary. Preserve exact error messages, command outcomes, file paths, counts, and any next action implied by the output.",
+		].join("\n");
+
+		const response = await completeSimple(
+			model,
+			{
+				systemPrompt: TOOL_RESULT_SUMMARY_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+			},
+			{ maxTokens: 1024, apiKey, headers, metadata: { piPurpose: "tool-result-guard" } },
+		);
+
+		if (response.stopReason === "error") {
+			throw new Error(response.errorMessage || "tool result summarization failed");
+		}
+
+		return response.content
+			.filter((item): item is TextContent => item.type === "text")
+			.map((item) => item.text)
+			.join("\n");
+	}
+
+	private async _resolveToolResultSummaryModel(): Promise<Model<any>> {
+		const settings = this.settingsManager.getToolResultGuardSettings();
+		const availableModels = await this._modelRegistry.getAvailable();
+		const candidates = [
+			settings.summaryModel,
+			DEFAULT_TOOL_RESULT_GUARD_SUMMARY_MODEL,
+			"anthropic/claude-haiku-4-5",
+		].filter((candidate, index, values) => candidate && values.indexOf(candidate) === index);
+
+		for (const candidate of candidates) {
+			const parsed = parseModelPattern(candidate, availableModels, { allowInvalidThinkingLevelFallback: false });
+			if (parsed.model && this._modelRegistry.hasConfiguredAuth(parsed.model)) {
+				return parsed.model;
+			}
+		}
+
+		if (this.model && this._modelRegistry.hasConfiguredAuth(this.model)) {
+			return this.model;
+		}
+
+		throw new Error(`No configured model available for tool result summarization (${settings.summaryModel})`);
 	}
 
 	// =========================================================================
@@ -2334,7 +2449,7 @@ export class AgentSession {
 		const autoResizeImages = this.settingsManager.getImageAutoResize();
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
-		const baseToolDefinitions = this._baseToolsOverride
+		const baseToolDefinitions: Record<string, ToolDefinition> = this._baseToolsOverride
 			? Object.fromEntries(
 					Object.entries(this._baseToolsOverride).map(([name, tool]) => [
 						name,
@@ -2345,6 +2460,12 @@ export class AgentSession {
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
+		if (!this._baseToolsOverride) {
+			baseToolDefinitions.LoadSkill = createLoadSkillToolDefinition(
+				() => this._resourceLoader.getSkills().skills,
+			) as ToolDefinition;
+			baseToolDefinitions.ReadBlob = createReadBlobToolDefinition(this._blobStore) as ToolDefinition;
+		}
 
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
@@ -2372,7 +2493,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: ["read", "bash", "edit", "write", "LoadSkill", "ReadBlob"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
@@ -2589,8 +2710,15 @@ export class AgentSession {
 				},
 			);
 
-			this.recordBashResult(command, result, options);
-			return result;
+			const recordedResult = options?.excludeFromContext
+				? result
+				: await guardBashResult(command, result, {
+						settings: this.settingsManager.getToolResultGuardSettings(),
+						blobStore: this._blobStore,
+						summarize: (text, metadata) => this._summarizeToolResultText(text, metadata),
+					});
+			this.recordBashResult(command, recordedResult, options);
+			return recordedResult;
 		} finally {
 			this._bashAbortController = undefined;
 		}

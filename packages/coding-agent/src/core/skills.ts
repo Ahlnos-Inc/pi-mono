@@ -14,6 +14,9 @@ const MAX_NAME_LENGTH = 64;
 /** Max description length per spec */
 const MAX_DESCRIPTION_LENGTH = 1024;
 
+/** Max catalog description length to keep startup prompts compact. */
+export const MAX_SKILL_CATALOG_DESCRIPTION_LENGTH = 120;
+
 const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
 
 type IgnoreMatcher = ReturnType<typeof ignore>;
@@ -346,8 +349,9 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 
 	const lines = [
 		"\n\nThe following skills provide specialized instructions for specific tasks.",
-		"Use the read tool to load a skill's file when the task matches its description.",
-		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"Use the LoadSkill tool to load a skill's full instructions when the task matches its description.",
+		"If LoadSkill is unavailable, use the /skill:name command or read the skill file when its location is known.",
+		"When a loaded skill references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
 		"",
 		"<available_skills>",
 	];
@@ -355,14 +359,21 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 	for (const skill of visibleSkills) {
 		lines.push("  <skill>");
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
-		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		lines.push(`    <description>${escapeXml(formatSkillCatalogDescription(skill.description))}</description>`);
 		lines.push("  </skill>");
 	}
 
 	lines.push("</available_skills>");
 
 	return lines.join("\n");
+}
+
+export function formatSkillCatalogDescription(description: string): string {
+	const oneLine = description.replace(/\s+/g, " ").trim();
+	if (oneLine.length <= MAX_SKILL_CATALOG_DESCRIPTION_LENGTH) {
+		return oneLine;
+	}
+	return `${oneLine.slice(0, MAX_SKILL_CATALOG_DESCRIPTION_LENGTH - 3).trimEnd()}...`;
 }
 
 function escapeXml(str: string): string {

@@ -244,7 +244,7 @@ describe("skills", () => {
 			expect(result).toContain("<skill>");
 			expect(result).toContain("<name>test-skill</name>");
 			expect(result).toContain("<description>A test skill.</description>");
-			expect(result).toContain("<location>/path/to/skill/SKILL.md</location>");
+			expect(result).not.toContain("<location>/path/to/skill/SKILL.md</location>");
 		});
 
 		it("should include intro text before XML", () => {
@@ -262,7 +262,27 @@ describe("skills", () => {
 			const introText = result.substring(0, xmlStart);
 
 			expect(introText).toContain("The following skills provide specialized instructions");
-			expect(introText).toContain("Use the read tool to load a skill's file");
+			expect(introText).toContain("Use the LoadSkill tool to load a skill's full instructions");
+		});
+
+		it("should truncate long descriptions in the prompt catalog", () => {
+			const longDescription = "This is a very long skill description ".repeat(8);
+			const skills: Skill[] = [
+				createTestSkill({
+					name: "long-description-skill",
+					description: longDescription,
+					filePath: "/path/to/skill/SKILL.md",
+					baseDir: "/path/to/skill",
+				}),
+			];
+
+			const result = formatSkillsForPrompt(skills);
+
+			expect(result).toContain(
+				"<description>This is a very long skill description This is a very long skill description",
+			);
+			expect(result).toContain("...</description>");
+			expect(result).not.toContain(longDescription);
 		});
 
 		it("should escape XML special characters", () => {
