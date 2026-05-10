@@ -865,4 +865,99 @@ describe("claude-cli provider", () => {
 		if (done?.type !== "done") throw new Error("Expected done event");
 		expect(done.message.content).toEqual([{ type: "text", text: "First:\n\nSecond." }]);
 	});
+
+	describe("session-resource cleanup waits for child exit", () => {
+		it("attempts graceful stdin EOF before SIGTERM, and resolves once child closes", async () => {
+			process.env.PI_CLAUDE_CLI_WORKERS = "1";
+			vi.useFakeTimers();
+			const child = new MockChildProcess();
+			spawnMock.mockReturnValue(child);
+			const stdinEndSpy = vi.spyOn(child.stdin, "end");
+
+			streamClaudeCli(model, context(), {});
+
+			let resolved = false;
+			const cleanupPromise = _clearClaudeCliStickySessionsForTest().then(() => {
+				resolved = true;
+			});
+
+			// Allow the cleanup microtasks to start so stdin.end() runs.
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(stdinEndSpy).toHaveBeenCalled();
+			expect(child.kill).not.toHaveBeenCalled();
+			expect(resolved).toBe(false);
+
+			// Child exits cleanly before SIGTERM grace window — no signals fire.
+			child.emit("close", 0);
+			await cleanupPromise;
+			expect(resolved).toBe(true);
+			expect(child.kill).not.toHaveBeenCalled();
+			vi.useRealTimers();
+		});
+
+		it("escalates to SIGTERM then SIGKILL when child does not close within timeout", async () => {
+			process.env.PI_CLAUDE_CLI_WORKERS = "1";
+			process.env.PI_CLAUDE_CLI_SHUTDOWN_TIMEOUT_MS = "400";
+			vi.useFakeTimers();
+			const child = new MockChildProcess();
+			spawnMock.mockReturnValue(child);
+
+			streamClaudeCli(model, context(), {});
+
+			let resolved = false;
+			const cleanupPromise = _clearClaudeCliStickySessionsForTest().then(() => {
+				resolved = true;
+			});
+
+			await Promise.resolve();
+			await Promise.resolve();
+
+			// Advance past the SIGTERM timer (min(300, 400/4) = 100ms).
+			await vi.advanceTimersByTimeAsync(150);
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(resolved).toBe(false);
+
+			// Advance past the SIGKILL timer (400ms total). Cleanup must resolve
+			// even though the child never emitted 'close' — /quit cannot hang.
+			await vi.advanceTimersByTimeAsync(400);
+			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+			await cleanupPromise;
+			expect(resolved).toBe(true);
+			vi.useRealTimers();
+			delete process.env.PI_CLAUDE_CLI_SHUTDOWN_TIMEOUT_MS;
+		});
+
+		it("respects PI_CLAUDE_CLI_SHUTDOWN_TIMEOUT_MS override", async () => {
+			process.env.PI_CLAUDE_CLI_WORKERS = "1";
+			process.env.PI_CLAUDE_CLI_SHUTDOWN_TIMEOUT_MS = "1200";
+			vi.useFakeTimers();
+			const child = new MockChildProcess();
+			spawnMock.mockReturnValue(child);
+
+			streamClaudeCli(model, context(), {});
+
+			let resolved = false;
+			const cleanupPromise = _clearClaudeCliStickySessionsForTest().then(() => {
+				resolved = true;
+			});
+
+			await Promise.resolve();
+			await Promise.resolve();
+
+			// Default timeout is 2000ms; with override at 1200ms the SIGKILL fires
+			// well before that. Advance to 1100ms — still below override — and
+			// confirm cleanup hasn't resolved yet.
+			await vi.advanceTimersByTimeAsync(1100);
+			expect(resolved).toBe(false);
+
+			// Cross the 1200ms override boundary.
+			await vi.advanceTimersByTimeAsync(200);
+			await cleanupPromise;
+			expect(resolved).toBe(true);
+			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+			vi.useRealTimers();
+			delete process.env.PI_CLAUDE_CLI_SHUTDOWN_TIMEOUT_MS;
+		});
+	});
 });

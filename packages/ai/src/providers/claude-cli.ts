@@ -78,26 +78,82 @@ const stickySessions = new Map<string, StickyClaudeSession>();
 const activeChildren = new Set<ReturnType<typeof spawn>>();
 const claudeWorkers = new Map<string, ClaudeWorker>();
 
-function cleanupClaudeCliSessionResources(): void {
+// Time to wait for a claude-cli child to exit (releasing the per-PID session
+// lock at ~/.claude/sessions/<pid>.json) before escalating to SIGKILL. Tuned
+// long enough for normal flush, short enough that /quit stays snappy.
+// Override via PI_CLAUDE_CLI_SHUTDOWN_TIMEOUT_MS.
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 2000;
+
+function shutdownTimeoutMs(): number {
+	return positiveEnvInt("PI_CLAUDE_CLI_SHUTDOWN_TIMEOUT_MS") ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+}
+
+function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<void> {
+	return new Promise<void>((resolve) => {
+		// Already exited (number) or signal-killed (string)? nothing to wait on.
+		// Live child has exitCode === null and signalCode === null on the real
+		// ChildProcess; mocks may surface undefined here, also "still running".
+		if (typeof child.exitCode === "number" || typeof child.signalCode === "string") {
+			resolve();
+			return;
+		}
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(sigtermTimer);
+			clearTimeout(sigkillTimer);
+			resolve();
+		};
+		child.once("close", settle);
+		// Graceful first: closing stdin signals claude-cli to flush its per-PID
+		// session lock and exit. SIGTERM after a brief grace window if the EOF
+		// goes unobserved. SIGKILL last so /quit cannot hang on a stuck child.
+		try {
+			child.stdin?.end();
+		} catch {
+			/* noop — stdin may already be closed */
+		}
+		const sigtermTimer = setTimeout(() => {
+			try {
+				child.kill("SIGTERM");
+			} catch {
+				/* noop */
+			}
+		}, Math.min(300, Math.floor(timeoutMs / 4)));
+		const sigkillTimer = setTimeout(() => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				/* noop */
+			}
+			settle();
+		}, timeoutMs);
+	});
+}
+
+async function cleanupClaudeCliSessionResources(): Promise<void> {
+	const timeoutMs = shutdownTimeoutMs();
+	// Mark every worker stopped (clears idle TTL timers). Don't kill from here —
+	// the worker's child is also tracked in activeChildren, and waitForChildExit
+	// runs there once per child.
 	for (const worker of claudeWorkers.values()) {
-		worker.stop();
+		worker.markStopped();
 	}
 	claudeWorkers.clear();
+	const waiters: Promise<void>[] = [];
 	for (const child of activeChildren) {
-		try {
-			child.kill("SIGTERM");
-		} catch {
-			/* noop */
-		}
+		waiters.push(waitForChildExit(child, timeoutMs));
 	}
 	activeChildren.clear();
 	stickySessions.clear();
+	await Promise.all(waiters);
 }
 
 registerSessionResourceCleanup(cleanupClaudeCliSessionResources);
 
-export function _clearClaudeCliStickySessionsForTest(): void {
-	cleanupClaudeCliSessionResources();
+export async function _clearClaudeCliStickySessionsForTest(): Promise<void> {
+	await cleanupClaudeCliSessionResources();
 }
 
 function positiveEnvInt(name: string): number | undefined {
@@ -1059,6 +1115,11 @@ class ClaudeWorker {
 		} catch {
 			/* noop */
 		}
+	}
+
+	markStopped(): void {
+		this.stopped = true;
+		if (this.idleTimer) clearTimeout(this.idleTimer);
 	}
 
 	private onStdout(chunk: string): void {

@@ -1,4 +1,4 @@
-export type SessionResourceCleanup = (sessionId?: string) => void;
+export type SessionResourceCleanup = (sessionId?: string) => void | Promise<void>;
 
 const sessionResourceCleanups = new Set<SessionResourceCleanup>();
 
@@ -9,11 +9,11 @@ export function registerSessionResourceCleanup(cleanup: SessionResourceCleanup):
 	};
 }
 
-export function cleanupSessionResources(sessionId?: string): void {
+export async function cleanupSessionResources(sessionId?: string): Promise<void> {
 	const errors: unknown[] = [];
 	for (const cleanup of sessionResourceCleanups) {
 		try {
-			cleanup(sessionId);
+			await cleanup(sessionId);
 		} catch (error) {
 			errors.push(error);
 		}
