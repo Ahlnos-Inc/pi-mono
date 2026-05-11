@@ -198,6 +198,32 @@ function claudeWorkersEnabled(): boolean {
 	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_WORKERS ?? "1");
 }
 
+// Per-workstream Claude sessions accumulate transcript on disk every turn under
+// --resume. Without rotation, a long-lived workstream (same agent+project marker
+// across pi restarts) can grow to >1M tokens of replayed prior history per turn,
+// dragging latency and diluting attention. Rotate when either bound trips —
+// turn-count caps unbounded same-day growth, age caps cross-day staleness.
+// Defaults sit comfortably above the typical multi-turn workstream pattern so
+// active work isn't interrupted mid-flow.
+const DEFAULT_SESSION_MAX_TURNS = 40;
+const DEFAULT_SESSION_MAX_AGE_HOURS = 48;
+
+function sessionRotationThresholds(): { maxTurns: number; maxAgeMs: number } {
+	const maxTurns = positiveEnvInt("PI_CLAUDE_CLI_SESSION_MAX_TURNS") ?? DEFAULT_SESSION_MAX_TURNS;
+	const maxAgeHours = positiveEnvInt("PI_CLAUDE_CLI_SESSION_MAX_AGE_HOURS") ?? DEFAULT_SESSION_MAX_AGE_HOURS;
+	return { maxTurns, maxAgeMs: maxAgeHours * 60 * 60 * 1000 };
+}
+
+function shouldRotateClaudeSession(record: ClaudeRegistryRecord): { rotate: boolean; reason?: string } {
+	const { maxTurns, maxAgeMs } = sessionRotationThresholds();
+	if (record.turns >= maxTurns) return { rotate: true, reason: `turns>=${maxTurns}` };
+	const createdAtMs = Date.parse(record.created_at);
+	if (Number.isFinite(createdAtMs) && Date.now() - createdAtMs >= maxAgeMs) {
+		return { rotate: true, reason: `age>=${Math.round(maxAgeMs / 3_600_000)}h` };
+	}
+	return { rotate: false };
+}
+
 function digestText(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
@@ -213,6 +239,7 @@ type ClaudeRegistryRecord = {
 	claude_session_id: string;
 	turns: number;
 	last_seen_message_count: number;
+	created_at: string;
 };
 
 function piRoot(): string {
@@ -278,7 +305,7 @@ function readClaudeSessionRegistry(sessionKey: string): ClaudeRegistryRecord | u
 	if (!claudeSessionRegistryEnabled()) return undefined;
 	ensureClaudeSessionRegistry();
 	const rows = runClaudeRegistrySql(
-		`select claude_session_id, turns, last_seen_message_count from claude_sessions where session_key = ${sqlString(sessionKey)} limit 1;`,
+		`select claude_session_id, turns, last_seen_message_count, created_at from claude_sessions where session_key = ${sqlString(sessionKey)} limit 1;`,
 	);
 	if (!rows?.trim()) return undefined;
 	try {
@@ -289,6 +316,7 @@ function readClaudeSessionRegistry(sessionKey: string): ClaudeRegistryRecord | u
 			claude_session_id: row.claude_session_id,
 			turns: Number.isFinite(row.turns) ? row.turns : 0,
 			last_seen_message_count: Number.isFinite(row.last_seen_message_count) ? row.last_seen_message_count : 0,
+			created_at: typeof row.created_at === "string" ? row.created_at : "",
 		};
 	} catch {
 		return undefined;
@@ -318,6 +346,7 @@ insert into claude_sessions (
   tool_policy_hash=excluded.tool_policy_hash,
   turns=excluded.turns,
   last_seen_message_count=excluded.last_seen_message_count,
+  created_at=case when claude_sessions.claude_session_id != excluded.claude_session_id then excluded.created_at else claude_sessions.created_at end,
   updated_at=excluded.updated_at,
   last_status=excluded.last_status;`);
 }
@@ -433,7 +462,9 @@ function getStickySession(
 	if (existing) return existing;
 	const metadata = claudeSessionMetadata(model, context, key);
 	const registryRecord = readClaudeSessionRegistry(key);
-	const session = registryRecord
+	const rotation = registryRecord ? shouldRotateClaudeSession(registryRecord) : { rotate: false };
+	const useRegistry = registryRecord && !rotation.rotate;
+	const session = useRegistry
 		? {
 				...metadata,
 				sessionId: registryRecord.claude_session_id,
@@ -443,11 +474,25 @@ function getStickySession(
 			}
 		: {
 				...metadata,
-				sessionId: uuidFromKey(`pi-claude-cli\n${key}`),
+				// Salt the uuid input so rotations produce a fresh UUID instead of
+				// re-deriving the deterministic one already in the registry row.
+				sessionId: uuidFromKey(
+					rotation.rotate
+						? `pi-claude-cli\n${key}\nrotated\n${new Date().toISOString()}`
+						: `pi-claude-cli\n${key}`,
+				),
 				turns: 0,
 				seenMessageCount: 0,
-				reuseStatus: "new" as const,
+				reuseStatus: rotation.rotate ? ("stale-recreated" as const) : ("new" as const),
 			};
+	if (rotation.rotate && registryRecord) {
+		appendClaudeSessionTelemetry(session, "rotated", {
+			reason: rotation.reason,
+			previousSessionId: registryRecord.claude_session_id,
+			previousTurns: registryRecord.turns,
+			previousCreatedAt: registryRecord.created_at,
+		});
+	}
 	upsertClaudeSessionRegistry(session, "ok");
 	stickySessions.set(key, session);
 	return session;
