@@ -913,9 +913,10 @@ function createWorkerRequestState(input: {
 			if (event.subtype === "init") {
 				responseModel = typeof event.model === "string" ? event.model : responseModel;
 				const toolCount = Array.isArray(event.tools) ? event.tools.length : undefined;
-				appendActivity(
-					toolCount ? `initialized ${event.model ?? input.model.id} with ${toolCount} tools` : "initialized",
-				);
+				const reusing = input.stickySession.turns > 0;
+				const shortId = `${input.stickySession.sessionId.slice(0, 8)}…`;
+				const verb = reusing ? `resumed (${shortId})` : "initialized";
+				appendActivity(toolCount ? `${verb} ${event.model ?? input.model.id} with ${toolCount} tools` : verb);
 			} else if (event.subtype === "status" && typeof event.status === "string") {
 				appendActivity(event.status === "requesting" ? "requesting model response" : event.status);
 			}
@@ -1369,9 +1370,10 @@ function runClaudeCliOneShot(
 			if (event.subtype === "init") {
 				responseModel = typeof event.model === "string" ? event.model : responseModel;
 				const toolCount = Array.isArray(event.tools) ? event.tools.length : undefined;
-				appendActivity(
-					toolCount ? `initialized ${event.model ?? model.id} with ${toolCount} tools` : "initialized",
-				);
+				const reusing = stickySession ? stickySession.turns > 0 : false;
+				const shortId = stickySession ? `${stickySession.sessionId.slice(0, 8)}…` : "";
+				const verb = reusing ? `resumed (${shortId})` : "initialized";
+				appendActivity(toolCount ? `${verb} ${event.model ?? model.id} with ${toolCount} tools` : verb);
 			} else if (event.subtype === "status" && typeof event.status === "string") {
 				appendActivity(event.status === "requesting" ? "requesting model response" : event.status);
 			}
