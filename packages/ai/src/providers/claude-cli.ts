@@ -114,13 +114,16 @@ function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): P
 		} catch {
 			/* noop — stdin may already be closed */
 		}
-		const sigtermTimer = setTimeout(() => {
-			try {
-				child.kill("SIGTERM");
-			} catch {
-				/* noop */
-			}
-		}, Math.min(300, Math.floor(timeoutMs / 4)));
+		const sigtermTimer = setTimeout(
+			() => {
+				try {
+					child.kill("SIGTERM");
+				} catch {
+					/* noop */
+				}
+			},
+			Math.min(300, Math.floor(timeoutMs / 4)),
+		);
 		const sigkillTimer = setTimeout(() => {
 			try {
 				child.kill("SIGKILL");
