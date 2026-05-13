@@ -8,7 +8,7 @@ import {
 	type UserQuestion,
 	type UserQuestionRequest,
 } from "@earendil-works/pi-ai";
-import { type Component, getKeybindings, type TUI } from "@earendil-works/pi-tui";
+import { type Component, getKeybindings, type TUI, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
@@ -265,18 +265,23 @@ function createQuestionnaireComponent(
 
 	return {
 		invalidate() {},
-		render(_width: number): string[] {
-			const lines = [
-				uiTheme.fg("accent", uiTheme.bold("Answer Claude's questions")),
+		render(width: number): string[] {
+			const safeWidth = Math.max(1, width);
+			const lines: string[] = [];
+			const addLine = (line = "") => {
+				lines.push(...wrapTextWithAnsi(line, safeWidth));
+			};
+			addLine(uiTheme.fg("accent", uiTheme.bold("Answer Claude's questions")));
+			addLine(
 				"Up/Down move option. Left/Right or Tab changes question. Space toggles. Enter selects/next/submits. Esc cancels.",
-				"",
-			];
+			);
+			addLine();
 			for (let questionIndex = 0; questionIndex < questions.length; questionIndex += 1) {
 				const question = questions[questionIndex];
 				const isActiveQuestion = questionIndex === activeQuestion;
 				const questionPrefix = isActiveQuestion ? ">" : " ";
 				const questionLabel = `${questionPrefix} ${questionIndex + 1}. ${question.header ? `${question.header}: ` : ""}${question.question}${question.multiSelect ? " (multi-select)" : ""}`;
-				lines.push(isActiveQuestion ? uiTheme.fg("accent", questionLabel) : questionLabel);
+				addLine(isActiveQuestion ? uiTheme.fg("accent", questionLabel) : questionLabel);
 				for (let optionIndex = 0; optionIndex < question.options.length; optionIndex += 1) {
 					const option = question.options[optionIndex];
 					const isActiveOption = isActiveQuestion && optionIndex === activeOption;
@@ -284,9 +289,9 @@ function createQuestionnaireComponent(
 					const selected = selection instanceof Set ? selection.has(optionIndex) : selection === optionIndex;
 					const marker = question.multiSelect ? (selected ? "[x]" : "[ ]") : selected ? "(*)" : "( )";
 					const optionLine = `  ${isActiveOption ? ">" : " "} ${marker} ${formatUserQuestionOption(option)}`;
-					lines.push(isActiveOption ? uiTheme.fg("accent", optionLine) : optionLine);
+					addLine(isActiveOption ? uiTheme.fg("accent", optionLine) : optionLine);
 				}
-				if (questionIndex < questions.length - 1) lines.push("");
+				if (questionIndex < questions.length - 1) addLine();
 			}
 			return lines;
 		},
