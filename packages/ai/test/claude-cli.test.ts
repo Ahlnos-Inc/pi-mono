@@ -268,6 +268,39 @@ describe("claude-cli provider", () => {
 		expect(secondSession).toBe(firstSession);
 	});
 
+	it("emits provider status for new and resumed Claude sessions without changing final text", async () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+		const firstChild = new MockChildProcess();
+		const secondChild = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(secondChild);
+
+		const firstEventsPromise = collectEvents(streamClaudeCli(model, context("same system"), {}));
+		writeJsonl(firstChild, [
+			{ type: "system", subtype: "init", model: model.id, tools: ["Read", "Edit"] },
+			{ type: "result", subtype: "success", result: "first", usage: {} },
+		]);
+		firstChild.emit("close", 0);
+		const firstEvents = await firstEventsPromise;
+		const firstStatuses = firstEvents.filter((event) => event.type === "status");
+		expect(firstStatuses[0]?.message).toContain("initializing new session");
+		expect(firstStatuses.at(-1)?.message).toContain("2 tools");
+
+		const secondEventsPromise = collectEvents(streamClaudeCli(model, context("same system"), {}));
+		writeJsonl(secondChild, [
+			{ type: "system", subtype: "init", model: model.id, tools: ["Read"] },
+			{ type: "result", subtype: "success", result: "second", usage: {} },
+		]);
+		secondChild.emit("close", 0);
+		const secondEvents = await secondEventsPromise;
+		const secondStatuses = secondEvents.filter((event) => event.type === "status");
+		expect(secondStatuses[0]?.message).toContain("resuming previous session");
+
+		const done = secondEvents.find((event) => event.type === "done");
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "second" }]);
+	});
+
 	it("can keep a long-lived worker for sequential same-boundary turns", async () => {
 		process.env.PI_CLAUDE_CLI_WORKERS = "1";
 		const child = new MockChildProcess();

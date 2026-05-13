@@ -298,6 +298,7 @@ export interface Context {
  */
 export type AssistantMessageEvent =
 	| { type: "start"; partial: AssistantMessage }
+	| { type: "status"; source?: string; statusKey?: string; message: string; partial: AssistantMessage }
 	| { type: "text_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "text_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "text_end"; contentIndex: number; content: string; partial: AssistantMessage }

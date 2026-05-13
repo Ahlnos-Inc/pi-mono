@@ -1128,6 +1128,33 @@ function activityLine(text: string): string {
 	return `[claude-cli] ${text}\n`;
 }
 
+function claudeSessionStatusVerb(session: StickyClaudeSession): string {
+	switch (session.reuseStatus) {
+		case "resume":
+			return "resuming previous session";
+		case "resumed-across-agents":
+			return "resuming session across agent context";
+		case "stale-recreated":
+			return "initializing replacement session";
+		case "ephemeral":
+			return "initializing one-turn session";
+		case "disabled":
+			return "initializing session";
+		default:
+			return "initializing new session";
+	}
+}
+
+function claudeSessionStatusMessage(
+	session: StickyClaudeSession,
+	modelId: string,
+	toolCount?: number | undefined,
+): string {
+	const shortId = session.sessionId.slice(0, 8);
+	const tools = toolCount === undefined ? "" : ` · ${toolCount} tool${toolCount === 1 ? "" : "s"}`;
+	return `Claude CLI: ${claudeSessionStatusVerb(session)} ${shortId} · ${modelId}${tools}`;
+}
+
 function textBlockBoundary(text: string): string {
 	if (text.trim().length === 0) return "";
 	return text.endsWith("\n") ? "" : "\n\n";
@@ -1188,6 +1215,16 @@ function createWorkerRequestState(input: {
 		if (finalText) return;
 		const line = activityLine(text);
 		updateDisplay(displayText + line, line);
+	};
+
+	const pushProviderStatus = (message: string) => {
+		stream.push({
+			type: "status",
+			source: "claude-cli",
+			statusKey: "claude-cli.session",
+			message,
+			partial: { ...partial, content: [{ type: "text", text: displayText }] },
+		});
 	};
 
 	const appendUserFacingToolText = (text: string) => {
@@ -1343,6 +1380,9 @@ function createWorkerRequestState(input: {
 				const reusing = input.stickySession.turns > 0;
 				const shortId = `${input.stickySession.sessionId.slice(0, 8)}…`;
 				const verb = reusing ? `resumed (${shortId})` : "initialized";
+				pushProviderStatus(
+					claudeSessionStatusMessage(input.stickySession, event.model ?? input.model.id, toolCount),
+				);
 				appendActivity(toolCount ? `${verb} ${event.model ?? input.model.id} with ${toolCount} tools` : verb);
 			} else if (event.subtype === "status" && typeof event.status === "string") {
 				appendActivity(event.status === "requesting" ? "requesting model response" : event.status);
@@ -1458,6 +1498,7 @@ function createWorkerRequestState(input: {
 	stream.push({ type: "start", partial });
 	partial.content = [{ type: "text", text: "" }];
 	stream.push({ type: "text_start", contentIndex: 0, partial: { ...partial, content: [{ type: "text", text: "" }] } });
+	pushProviderStatus(claudeSessionStatusMessage(input.stickySession, input.model.id));
 	resetIdleTimer();
 	if (maxRuntimeMs !== undefined) {
 		maxRuntimeTimer = setTimeout(() => {
@@ -1839,6 +1880,18 @@ function runClaudeCliOneShot(
 	partial.content = [{ type: "text", text: "" }];
 	stream.push({ type: "text_start", contentIndex: 0, partial: { ...partial, content: [{ type: "text", text: "" }] } });
 
+	const pushProviderStatus = (message: string) => {
+		stream.push({
+			type: "status",
+			source: "claude-cli",
+			statusKey: "claude-cli.session",
+			message,
+			partial: { ...partial, content: [{ type: "text", text: displayText }] },
+		});
+	};
+
+	if (stickySession) pushProviderStatus(claudeSessionStatusMessage(stickySession, model.id));
+
 	child.stdout?.setEncoding("utf8");
 	child.stderr?.setEncoding("utf8");
 
@@ -1893,6 +1946,8 @@ function runClaudeCliOneShot(
 				const reusing = stickySession ? stickySession.turns > 0 : false;
 				const shortId = stickySession ? `${stickySession.sessionId.slice(0, 8)}…` : "";
 				const verb = reusing ? `resumed (${shortId})` : "initialized";
+				if (stickySession)
+					pushProviderStatus(claudeSessionStatusMessage(stickySession, event.model ?? model.id, toolCount));
 				appendActivity(toolCount ? `${verb} ${event.model ?? model.id} with ${toolCount} tools` : verb);
 			} else if (event.subtype === "status" && typeof event.status === "string") {
 				appendActivity(event.status === "requesting" ? "requesting model response" : event.status);

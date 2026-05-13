@@ -296,6 +296,16 @@ async function streamAssistantResponse(
 				await emit({ type: "message_start", message: { ...partialMessage } });
 				break;
 
+			case "status":
+				if (partialMessage) {
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+
 			case "text_start":
 			case "text_delta":
 			case "text_end":

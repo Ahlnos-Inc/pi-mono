@@ -270,6 +270,7 @@ export class InteractiveMode {
 	private submittedUserEchoText: string | undefined = undefined;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
+	private providerWorkingMessage: string | undefined = undefined;
 	private workingStartedAtMs: number | undefined = undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
@@ -1697,8 +1698,19 @@ export class InteractiveMode {
 		return `Generating with ${modelLabel}${elapsed} · ${keyText("app.interrupt")} to interrupt`;
 	}
 
+	private getProviderWorkingLoaderMessage(): (() => string) | undefined {
+		if (!this.providerWorkingMessage) return undefined;
+		return () => {
+			const startedAt = this.workingStartedAtMs;
+			const elapsed = startedAt ? ` · ${formatElapsed(Date.now() - startedAt)}` : "";
+			return `${this.providerWorkingMessage}${elapsed} · ${keyText("app.interrupt")} to interrupt`;
+		};
+	}
+
 	private getWorkingLoaderMessage(): string | (() => string) {
-		return this.workingMessage ?? (() => this.getDefaultWorkingLoaderMessage());
+		return (
+			this.workingMessage ?? this.getProviderWorkingLoaderMessage() ?? (() => this.getDefaultWorkingLoaderMessage())
+		);
 	}
 
 	private createWorkingLoader(): Loader {
@@ -1738,6 +1750,13 @@ export class InteractiveMode {
 		this.workingIndicatorOptions = options;
 		this.loadingAnimation?.setIndicator(options);
 		this.ui.requestRender();
+	}
+
+	private setProviderWorkingMessage(message: string | undefined): void {
+		this.providerWorkingMessage = message;
+		if (this.loadingAnimation && !this.workingMessage) {
+			this.loadingAnimation.setMessage(this.getWorkingLoaderMessage());
+		}
 	}
 
 	private setHiddenThinkingLabel(label?: string): void {
@@ -1833,6 +1852,7 @@ export class InteractiveMode {
 		this.defaultEditor.onExtensionShortcut = undefined;
 		this.updateTerminalTitle();
 		this.workingMessage = undefined;
+		this.providerWorkingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
 		if (this.loadingAnimation) {
@@ -2744,6 +2764,7 @@ export class InteractiveMode {
 			case "agent_start":
 				this.pendingTools.clear();
 				this.workingStartedAtMs = Date.now();
+				this.providerWorkingMessage = undefined;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -2810,6 +2831,10 @@ export class InteractiveMode {
 				break;
 
 			case "message_update":
+				if (event.assistantMessageEvent.type === "status") {
+					this.setProviderWorkingMessage(event.assistantMessageEvent.message);
+					break;
+				}
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					this.streamingComponent.updateContent(this.streamingMessage);
@@ -2928,6 +2953,7 @@ export class InteractiveMode {
 
 			case "agent_end":
 				this.workingStartedAtMs = undefined;
+				this.providerWorkingMessage = undefined;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
