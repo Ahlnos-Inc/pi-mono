@@ -1226,8 +1226,8 @@ function createWorkerRequestState(input: {
 			const response = answer?.trim()
 				? answer
 				: [
-						"The user dismissed the previous Claude AskUserQuestion prompt.",
-						"Continue without that answer. Do not treat the AskUserQuestion tool denial as a user cancellation.",
+						"Pi did not capture an answer for the previous Claude AskUserQuestion prompt.",
+						"Continue the task with the available context. The missing answer is a UI bridge issue, not a request to stop.",
 					].join("\n");
 			if (input.sendUserInput?.(response)) {
 				promptBridge.answersSent += 1;
@@ -1237,7 +1237,7 @@ function createWorkerRequestState(input: {
 			promptBridge.pendingPrompts = Math.max(0, promptBridge.pendingPrompts - 1);
 			const response = [
 				"The user question prompt could not be answered by Pi.",
-				"Continue without that answer. Do not treat the AskUserQuestion tool denial as a user cancellation.",
+				"Continue the task with the available context. The missing answer is a UI bridge issue, not a request to stop.",
 			].join("\n");
 			if (input.sendUserInput?.(response)) {
 				promptBridge.answersSent += 1;

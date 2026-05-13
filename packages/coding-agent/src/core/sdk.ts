@@ -172,52 +172,77 @@ function formatUserQuestionOption(option: UserQuestion["options"][number]): stri
 	return option.description ? `${option.label} - ${option.description}` : option.label;
 }
 
+function formatUserQuestionForDisplay(question: UserQuestion, index: number): string {
+	const lines = [`${index + 1}. ${question.header ? `${question.header}: ` : ""}${question.question}`];
+	if (question.multiSelect) lines.push("(multi-select)");
+	for (const option of question.options) lines.push(`- ${formatUserQuestionOption(option)}`);
+	return lines.join("\n");
+}
+
+function formatUserQuestionnaire(request: UserQuestionRequest): string {
+	return request.questions.map(formatUserQuestionForDisplay).join("\n\n");
+}
+
+function extractQuestionnaireAnswer(text: string, marker: string): string {
+	const markerIndex = text.lastIndexOf(marker);
+	if (markerIndex === -1) return text.trim();
+	return text.slice(markerIndex + marker.length).trim();
+}
+
+function noCapturedQuestionAnswerResponse(): string {
+	return [
+		"Pi did not capture an answer for the previous Claude question prompt.",
+		"Continue the task with the available context. The missing answer is a UI bridge issue, not a request to stop.",
+	].join("\n");
+}
+
 async function answerUserQuestionViaExtensionUi(
 	request: UserQuestionRequest,
 	runner: ExtensionRunner | undefined,
 ): Promise<string | undefined> {
 	if (!runner?.hasUI()) return undefined;
 	const ui = runner.getUIContext();
-	const answers: string[] = [];
-	for (let index = 0; index < request.questions.length; index += 1) {
-		const question = request.questions[index];
-		const title = formatUserQuestionTitle(question, index, request.questions.length);
-		let answer: string | undefined;
-		if (question.options.length > 0 && !question.multiSelect) {
-			answer = await ui.select(title, question.options.map(formatUserQuestionOption));
-		} else {
-			const placeholder =
-				question.options.length > 0
-					? `Answer with one or more options: ${question.options.map((option) => option.label).join(", ")}`
-					: "Type your answer";
-			answer = await ui.input(
-				question.options.length > 0
-					? `${title}\n\n${question.options.map((option) => `- ${formatUserQuestionOption(option)}`).join("\n")}`
-					: title,
-				placeholder,
-			);
-		}
+
+	if (request.questions.length === 1 && request.questions[0].options.length > 0 && !request.questions[0].multiSelect) {
+		const question = request.questions[0];
+		const answer = await ui.select(
+			formatUserQuestionTitle(question, 0, 1),
+			question.options.map(formatUserQuestionOption),
+		);
 		const normalizedAnswer = answer?.trim();
 		if (!normalizedAnswer) {
-			ui.notify("Question dismissed; continuing without an answer.", "warning");
-			return [
-				"The user dismissed the previous question prompt.",
-				"Continue without that answer. Do not treat the provider-side prompt denial as a user cancellation.",
-			].join("\n");
+			ui.notify("No Claude question answer captured; continuing.", "warning");
+			return noCapturedQuestionAnswerResponse();
 		}
-		answers.push(
-			[
-				`${index + 1}. ${question.header ? `${question.header}: ` : ""}${question.question}`,
-				`Answer: ${normalizedAnswer}`,
-			].join("\n"),
-		);
+		return [
+			"Claude asked the user:",
+			formatUserQuestionForDisplay(question, 0),
+			"",
+			"User response:",
+			normalizedAnswer,
+			"",
+			"Continue from this response. The provider-side prompt denial is not a request to stop.",
+		].join("\n");
 	}
+
+	const answerMarker = "Answers:";
+	const questionText = formatUserQuestionnaire(request);
+	const promptText = [questionText, "", answerMarker].join("\n");
+	const answer = await ui.editor("Answer Claude's questions", promptText);
+	const normalizedAnswer = answer ? extractQuestionnaireAnswer(answer, answerMarker) : "";
+	if (!normalizedAnswer) {
+		ui.notify("No Claude question answer captured; continuing.", "warning");
+		return noCapturedQuestionAnswerResponse();
+	}
+
 	return [
-		"User answered the previous question prompt:",
+		"Claude asked the user:",
+		questionText,
 		"",
-		...answers,
+		"User response:",
+		normalizedAnswer,
 		"",
-		"Continue from these answers. Do not treat the provider-side prompt denial as a user cancellation.",
+		"Continue from this response. The provider-side prompt denial is not a request to stop.",
 	].join("\n");
 }
 

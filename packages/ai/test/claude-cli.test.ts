@@ -346,6 +346,49 @@ describe("claude-cli provider", () => {
 		expect(done.message.content).toEqual([{ type: "text", text: "final after answer" }]);
 	});
 
+	it("continues AskUserQuestion prompts without telling Claude the user cancelled when no answer is captured", async () => {
+		process.env.PI_CLAUDE_CLI_WORKERS = "1";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(child);
+
+		const stream = streamClaudeCli(model, context("same system"), {
+			onUserQuestion: async () => undefined,
+		});
+		const eventsPromise = collectEvents(stream);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "toolu_1", name: "AskUserQuestion" },
+				},
+			},
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "input_json_delta", partial_json: '{"question":"Choose a path"}' },
+				},
+			},
+			{ type: "result", subtype: "success", result: "intermediate auto-denial", usage: {} },
+		]);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const payloads = userEnvelopePayloads(child);
+		expect(payloads[1]).toContain("Pi did not capture an answer");
+		expect(payloads[1]).not.toMatch(/cancelled|canceled|dismissed/i);
+
+		writeJsonl(child, [{ type: "result", subtype: "success", result: "continued", usage: {} }]);
+		const events = await eventsPromise;
+		const done = events.find((event) => event.type === "done");
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "continued" }]);
+	});
+
 	it("keeps a long-lived worker when only prompt-scoped Pi retrieval changes", async () => {
 		process.env.PI_CLAUDE_CLI_WORKERS = "1";
 		const child = new MockChildProcess();
