@@ -8,6 +8,7 @@ import {
 	type UserQuestion,
 	type UserQuestionRequest,
 } from "@earendil-works/pi-ai";
+import { type Component, getKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
@@ -162,12 +163,6 @@ function getAttributionHeaders(
 	return undefined;
 }
 
-function formatUserQuestionTitle(question: UserQuestion, index: number, total: number): string {
-	const header = question.header ? `${question.header}: ` : "";
-	const prefix = total > 1 ? `Question ${index + 1}/${total}` : "Question";
-	return `${prefix}\n\n${header}${question.question}`;
-}
-
 function formatUserQuestionOption(option: UserQuestion["options"][number]): string {
 	return option.description ? `${option.label} - ${option.description}` : option.label;
 }
@@ -196,6 +191,140 @@ function noCapturedQuestionAnswerResponse(): string {
 	].join("\n");
 }
 
+type QuestionSelection = number | Set<number>;
+
+function buildQuestionAnswerText(request: UserQuestionRequest, selections: QuestionSelection[]): string {
+	const answers = request.questions.map((question, index) => {
+		const selection = selections[index];
+		const selectedOptions =
+			selection instanceof Set
+				? [...selection].sort((a, b) => a - b).map((optionIndex) => question.options[optionIndex])
+				: [question.options[selection]];
+		const answer = selectedOptions.filter(Boolean).map(formatUserQuestionOption).join(", ") || "No option selected";
+		return [
+			`${index + 1}. ${question.header ? `${question.header}: ` : ""}${question.question}`,
+			`Answer: ${answer}`,
+		].join("\n");
+	});
+	return [
+		"Claude asked the user:",
+		formatUserQuestionnaire(request),
+		"",
+		"User response:",
+		...answers,
+		"",
+		"Continue from this response. The provider-side prompt denial is not a request to stop.",
+	].join("\n");
+}
+
+function createQuestionnaireComponent(
+	request: UserQuestionRequest,
+	tui: TUI,
+	uiTheme: { fg(color: string, text: string): string; bold(text: string): string },
+	done: (answer: string | undefined) => void,
+): Component {
+	const questions = request.questions;
+	const selections: QuestionSelection[] = questions.map((question) => (question.multiSelect ? new Set<number>() : -1));
+	let activeQuestion = 0;
+	let activeOption = 0;
+
+	const clampActiveOption = () => {
+		const optionCount = questions[activeQuestion]?.options.length ?? 0;
+		activeOption = Math.max(0, Math.min(activeOption, Math.max(0, optionCount - 1)));
+	};
+
+	const moveQuestion = (delta: number) => {
+		activeQuestion = Math.max(0, Math.min(questions.length - 1, activeQuestion + delta));
+		clampActiveOption();
+		tui.requestRender();
+	};
+
+	const submit = () => done(buildQuestionAnswerText(request, selections));
+
+	const selectActive = (advance: boolean) => {
+		const question = questions[activeQuestion];
+		if (!question) return;
+		if (question.multiSelect) {
+			const selection = selections[activeQuestion];
+			if (selection instanceof Set) {
+				if (advance) {
+					if (selection.size === 0) selection.add(activeOption);
+				} else if (selection.has(activeOption)) selection.delete(activeOption);
+				else selection.add(activeOption);
+			}
+		} else {
+			selections[activeQuestion] = activeOption;
+		}
+		if (advance) {
+			if (activeQuestion >= questions.length - 1) submit();
+			else moveQuestion(1);
+		} else {
+			tui.requestRender();
+		}
+	};
+
+	return {
+		invalidate() {},
+		render(_width: number): string[] {
+			const lines = [
+				uiTheme.fg("accent", uiTheme.bold("Answer Claude's questions")),
+				"Up/Down move option. Left/Right or Tab changes question. Space toggles. Enter selects/next/submits. Esc cancels.",
+				"",
+			];
+			for (let questionIndex = 0; questionIndex < questions.length; questionIndex += 1) {
+				const question = questions[questionIndex];
+				const isActiveQuestion = questionIndex === activeQuestion;
+				const questionPrefix = isActiveQuestion ? ">" : " ";
+				const questionLabel = `${questionPrefix} ${questionIndex + 1}. ${question.header ? `${question.header}: ` : ""}${question.question}${question.multiSelect ? " (multi-select)" : ""}`;
+				lines.push(isActiveQuestion ? uiTheme.fg("accent", questionLabel) : questionLabel);
+				for (let optionIndex = 0; optionIndex < question.options.length; optionIndex += 1) {
+					const option = question.options[optionIndex];
+					const isActiveOption = isActiveQuestion && optionIndex === activeOption;
+					const selection = selections[questionIndex];
+					const selected = selection instanceof Set ? selection.has(optionIndex) : selection === optionIndex;
+					const marker = question.multiSelect ? (selected ? "[x]" : "[ ]") : selected ? "(*)" : "( )";
+					const optionLine = `  ${isActiveOption ? ">" : " "} ${marker} ${formatUserQuestionOption(option)}`;
+					lines.push(isActiveOption ? uiTheme.fg("accent", optionLine) : optionLine);
+				}
+				if (questionIndex < questions.length - 1) lines.push("");
+			}
+			return lines;
+		},
+		handleInput(data: string): void {
+			const kb = getKeybindings();
+			if (kb.matches(data, "tui.select.cancel")) {
+				done(undefined);
+				return;
+			}
+			if (kb.matches(data, "tui.select.up")) {
+				activeOption = Math.max(0, activeOption - 1);
+				tui.requestRender();
+				return;
+			}
+			if (kb.matches(data, "tui.select.down")) {
+				activeOption = Math.min(questions[activeQuestion].options.length - 1, activeOption + 1);
+				tui.requestRender();
+				return;
+			}
+			if (kb.matches(data, "tui.editor.cursorLeft")) {
+				moveQuestion(-1);
+				return;
+			}
+			if (kb.matches(data, "tui.editor.cursorRight") || data === "\t") {
+				moveQuestion(1);
+				return;
+			}
+			if (data === " ") {
+				selectActive(false);
+				return;
+			}
+			if (kb.matches(data, "tui.select.confirm") || data === "\n") {
+				selectActive(true);
+			}
+		},
+	};
+}
+
 async function answerUserQuestionViaExtensionUi(
 	request: UserQuestionRequest,
 	runner: ExtensionRunner | undefined,
@@ -203,26 +332,16 @@ async function answerUserQuestionViaExtensionUi(
 	if (!runner?.hasUI()) return undefined;
 	const ui = runner.getUIContext();
 
-	if (request.questions.length === 1 && request.questions[0].options.length > 0 && !request.questions[0].multiSelect) {
-		const question = request.questions[0];
-		const answer = await ui.select(
-			formatUserQuestionTitle(question, 0, 1),
-			question.options.map(formatUserQuestionOption),
+	if (request.questions.every((question) => question.options.length > 0)) {
+		const answer = await ui.custom<string | undefined>((tui, theme, _keybindings, done) =>
+			createQuestionnaireComponent(request, tui, theme, done),
 		);
 		const normalizedAnswer = answer?.trim();
 		if (!normalizedAnswer) {
 			ui.notify("No Claude question answer captured; continuing.", "warning");
 			return noCapturedQuestionAnswerResponse();
 		}
-		return [
-			"Claude asked the user:",
-			formatUserQuestionForDisplay(question, 0),
-			"",
-			"User response:",
-			normalizedAnswer,
-			"",
-			"Continue from this response. The provider-side prompt denial is not a request to stop.",
-		].join("\n");
+		return normalizedAnswer;
 	}
 
 	const answerMarker = "Answers:";
