@@ -230,12 +230,32 @@ function sessionRotationThresholds(): { maxTurns: number; maxAgeMs: number } {
 
 function shouldRotateClaudeSession(record: ClaudeRegistryRecord): { rotate: boolean; reason?: string } {
 	const { maxTurns, maxAgeMs } = sessionRotationThresholds();
+	if (record.last_status === "error") return { rotate: true, reason: "last_status=error" };
 	if (record.turns >= maxTurns) return { rotate: true, reason: `turns>=${maxTurns}` };
 	const createdAtMs = Date.parse(record.created_at);
 	if (Number.isFinite(createdAtMs) && Date.now() - createdAtMs >= maxAgeMs) {
 		return { rotate: true, reason: `age>=${Math.round(maxAgeMs / 3_600_000)}h` };
 	}
 	return { rotate: false };
+}
+
+function isRecoverableClaudeSessionError(message: string): boolean {
+	return /Session ID .* is already in use|No conversation found|not found|invalid session/i.test(message);
+}
+
+function rotateStickyClaudeSession(session: StickyClaudeSession, reason: string): void {
+	if (session.ephemeral) return;
+	const previousSessionId = session.sessionId;
+	stickySessions.delete(session.sessionKey);
+	session.reuseStatus = "stale-recreated";
+	session.turns = 0;
+	session.seenMessageCount = 0;
+	session.sessionId = uuidFromKey(`pi-claude-cli\n${session.sessionKey}\nrecovered\n${Date.now()}\n${randomUUID()}`);
+	stickySessions.set(session.sessionKey, session);
+	appendClaudeSessionTelemetry(session, "session-rotated-after-error", {
+		reason,
+		previousSessionId,
+	});
 }
 
 function digestText(text: string): string {
@@ -257,6 +277,7 @@ type ClaudeRegistryRecord = {
 	system_prompt_hash: string;
 	agent_chosen?: string;
 	project_class?: string;
+	last_status?: string;
 };
 
 function piRoot(): string {
@@ -399,7 +420,7 @@ function readClaudeSessionRegistry(sessionKey: string): ClaudeRegistryRecord | u
 	if (!claudeSessionRegistryEnabled()) return undefined;
 	ensureClaudeSessionRegistry();
 	const rows = runClaudeRegistrySql(
-		`select claude_session_id, turns, last_seen_message_count, created_at, system_prompt_hash, agent_chosen, project_class from claude_sessions where session_key = ${sqlString(sessionKey)} limit 1;`,
+		`select claude_session_id, turns, last_seen_message_count, created_at, system_prompt_hash, agent_chosen, project_class, last_status from claude_sessions where session_key = ${sqlString(sessionKey)} limit 1;`,
 	);
 	if (!rows?.trim()) return undefined;
 	try {
@@ -414,6 +435,7 @@ function readClaudeSessionRegistry(sessionKey: string): ClaudeRegistryRecord | u
 			system_prompt_hash: typeof row.system_prompt_hash === "string" ? row.system_prompt_hash : "",
 			agent_chosen: typeof row.agent_chosen === "string" ? row.agent_chosen : undefined,
 			project_class: typeof row.project_class === "string" ? row.project_class : undefined,
+			last_status: typeof row.last_status === "string" ? row.last_status : undefined,
 		};
 	} catch {
 		return undefined;
@@ -1348,6 +1370,9 @@ function createWorkerRequestState(input: {
 
 	function fail(stopReason: AssistantMessage["stopReason"], errorMessage: string) {
 		cleanup();
+		if (!input.stickySession.ephemeral && isRecoverableClaudeSessionError(errorMessage)) {
+			rotateStickyClaudeSession(input.stickySession, errorMessage);
+		}
 		upsertClaudeSessionRegistry(input.stickySession, "error");
 		appendClaudeSessionTelemetry(input.stickySession, "worker-error", { error: errorMessage });
 		const message = buildAssistantMessage(
@@ -2163,15 +2188,8 @@ function runClaudeCliOneShot(
 		if (code !== 0) {
 			const errMsg = stderr.trim() || `claude -p exited with code ${code}`;
 			if (stickySession) {
-				if (
-					!stickySession.ephemeral &&
-					/Session ID .* is already in use|No conversation found|not found|invalid session/i.test(errMsg)
-				) {
-					stickySessions.delete(stickySession.sessionKey);
-					stickySession.reuseStatus = "stale-recreated";
-					stickySession.turns = 0;
-					stickySession.seenMessageCount = 0;
-					stickySession.sessionId = uuidFromKey(`pi-claude-cli\n${stickySession.sessionKey}\n${Date.now()}`);
+				if (!stickySession.ephemeral && isRecoverableClaudeSessionError(errMsg)) {
+					rotateStickyClaudeSession(stickySession, errMsg);
 				}
 				upsertClaudeSessionRegistry(stickySession, "error");
 				appendClaudeSessionTelemetry(stickySession, "error", { error: errMsg });

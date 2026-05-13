@@ -331,6 +331,42 @@ describe("claude-cli provider", () => {
 		expect(done.message.content).toEqual([{ type: "text", text: "second" }]);
 	});
 
+	it("rotates a long-lived worker session after Claude reports the session id is already in use", async () => {
+		process.env.PI_CLAUDE_CLI_WORKERS = "1";
+		process.env.PI_CLAUDE_CLI_SESSION_REGISTRY = "1";
+		const root = mkdtempSync(join(tmpdir(), "pi-claude-worker-locked-session-"));
+		process.env.PI_ROOT = root;
+		try {
+			const firstChild = new MockChildProcess();
+			const secondChild = new MockChildProcess();
+			spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(secondChild);
+
+			const firstStream = streamClaudeCli(model, context("same system"), {});
+			const firstEventsPromise = collectEvents(firstStream);
+			firstChild.stderr.write("Error: Session ID locked-session is already in use.");
+			firstChild.emit("close", 1);
+			const firstEvents = await firstEventsPromise;
+
+			const firstArgs = spawnMock.mock.calls[0][1] as string[];
+			const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+			const firstError = firstEvents.find((event) => event.type === "error");
+			expect(firstError?.type).toBe("error");
+
+			const secondStream = streamClaudeCli(model, context("same system"), {});
+			const secondEventsPromise = collectEvents(secondStream);
+			writeJsonl(secondChild, [{ type: "result", subtype: "success", result: "recovered", usage: {} }]);
+			await secondEventsPromise;
+
+			expect(spawnMock).toHaveBeenCalledTimes(2);
+			const secondArgs = spawnMock.mock.calls[1][1] as string[];
+			const secondSession = secondArgs[secondArgs.indexOf("--session-id") + 1];
+			expect(secondArgs).toContain("--session-id");
+			expect(secondSession).not.toBe(firstSession);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("answers Claude AskUserQuestion prompts through a long-lived worker", async () => {
 		process.env.PI_CLAUDE_CLI_WORKERS = "1";
 		const child = new MockChildProcess();
