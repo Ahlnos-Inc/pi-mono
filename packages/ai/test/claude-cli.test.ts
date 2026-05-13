@@ -86,6 +86,7 @@ describe("claude-cli provider", () => {
 		vi.useRealTimers();
 		delete process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT;
 		delete process.env.PI_CLAUDE_CLI_STICKY_SESSIONS;
+		delete process.env.TMUX_PANE;
 		process.env.PI_CLAUDE_CLI_WORKERS = "0";
 		process.env.PI_CLAUDE_CLI_SESSION_REGISTRY = "0";
 		process.env.PI_CLAUDE_CLI_SESSION_TELEMETRY = "0";
@@ -289,6 +290,43 @@ describe("claude-cli provider", () => {
 		expect(payloads[1]).toContain("Current question:\nagain");
 	});
 
+	it("restarts an idle worker with append-system-prompt when agent context changes", async () => {
+		process.env.PI_CLAUDE_CLI_WORKERS = "1";
+		process.env.TMUX_PANE = "%7";
+		const firstChild = new MockChildProcess();
+		const secondChild = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(secondChild);
+
+		const firstSystem = `<!-- pi-router-session agent="agency/engineering/engineering-backend-architect" project="pi-infra" -->\n\nbackend context`;
+		const secondSystem = `<!-- pi-router-session agent="agency/engineering/engineering-devops-automator" project="pi-infra" -->\n\ndevops context`;
+
+		const firstStream = streamClaudeCli(model, context(firstSystem), { sessionId: "window-uuid" });
+		const firstEventsPromise = collectEvents(firstStream);
+		writeJsonl(firstChild, [{ type: "result", subtype: "success", result: "first", usage: {} }]);
+		await firstEventsPromise;
+
+		const secondStream = streamClaudeCli(model, context(secondSystem), { sessionId: "window-uuid" });
+		const secondEventsPromise = collectEvents(secondStream);
+		await Promise.resolve();
+		expect(firstChild.kill).toHaveBeenCalledWith("SIGTERM");
+		firstChild.emit("close", 0);
+		await Promise.resolve();
+		await Promise.resolve();
+		writeJsonl(secondChild, [{ type: "result", subtype: "success", result: "second", usage: {} }]);
+		const secondEvents = await secondEventsPromise;
+
+		expect(spawnMock).toHaveBeenCalledTimes(2);
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+		const secondSession = secondArgs[secondArgs.indexOf("--resume") + 1];
+		expect(secondSession).toBe(firstSession);
+		expect(secondArgs).toContain("--append-system-prompt");
+		expect(secondArgs).toContain(secondSystem);
+		const done = secondEvents.find((event) => event.type === "done");
+		expect(done?.type).toBe("done");
+	});
+
 	it("keeps the worker alive on abort and reuses it for the next prompt (barge-in)", async () => {
 		process.env.PI_CLAUDE_CLI_WORKERS = "1";
 		const child = new MockChildProcess();
@@ -489,6 +527,7 @@ describe("claude-cli provider", () => {
 		// This is enforced by deriving the session-key boundary from the marker
 		// digest when present, instead of from the per-pi-mono sessionId/pid.
 		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+		process.env.TMUX_PANE = "%42";
 		const originalPid = Object.getOwnPropertyDescriptor(process, "pid");
 		const firstChild = new MockChildProcess();
 		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
@@ -515,6 +554,46 @@ describe("claude-cli provider", () => {
 		expect(secondArgs).toContain("--resume");
 
 		if (originalPid) Object.defineProperty(process, "pid", originalPid);
+	});
+
+	it("reuses a router sticky session across agent hops in the same project and pane", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+		process.env.TMUX_PANE = "%7";
+		const firstChild = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(firstChild).mockReturnValueOnce(new MockChildProcess());
+
+		const turn1Marker = `<!-- pi-router-session agent="agency/engineering/engineering-backend-architect" project="pi-infra" -->`;
+		const turn2Marker = `<!-- pi-router-session agent="agency/engineering/engineering-devops-automator" project="pi-infra" -->`;
+
+		streamClaudeCli(model, context(`${turn1Marker}\n\nbackend context`), { sessionId: "windowA-uuid" });
+		writeJsonl(firstChild, [{ type: "result", subtype: "success", result: "ok", usage: {} }]);
+		streamClaudeCli(model, context(`${turn2Marker}\n\ndevops context`), { sessionId: "windowA-uuid" });
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+		const secondSession = secondArgs[secondArgs.indexOf("--resume") + 1];
+
+		expect(secondSession).toBe(firstSession);
+		expect(secondArgs).toContain("--append-system-prompt");
+		expect(secondArgs).toContain(`${turn2Marker}\n\ndevops context`);
+	});
+
+	it("does not share router sticky sessions across tmux panes", () => {
+		process.env.PI_CLAUDE_CLI_STICKY_SESSIONS = "1";
+		const marker = `<!-- pi-router-session agent="agency/engineering/engineering-devops-automator" project="pi-infra" -->`;
+
+		process.env.TMUX_PANE = "%1";
+		streamClaudeCli(model, context(marker), { sessionId: "same-session-id" });
+		process.env.TMUX_PANE = "%2";
+		streamClaudeCli(model, context(marker), { sessionId: "same-session-id" });
+
+		const firstArgs = spawnMock.mock.calls[0][1] as string[];
+		const secondArgs = spawnMock.mock.calls[1][1] as string[];
+		const firstSession = firstArgs[firstArgs.indexOf("--session-id") + 1];
+		const secondSession = secondArgs[secondArgs.indexOf("--session-id") + 1];
+
+		expect(secondSession).not.toBe(firstSession);
 	});
 
 	it("does NOT reuse sticky session across pi-mono process boundaries when no marker is present", () => {

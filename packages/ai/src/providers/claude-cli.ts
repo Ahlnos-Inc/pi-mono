@@ -66,11 +66,13 @@ type StickyClaudeSession = {
 	sessionId: string;
 	turns: number;
 	seenMessageCount: number;
-	reuseStatus: "new" | "resume" | "disabled" | "stale-recreated" | "ephemeral";
+	reuseStatus: "new" | "resume" | "resumed-across-agents" | "disabled" | "stale-recreated" | "ephemeral";
 	model: string;
 	cwd: string;
 	systemPromptHash: string;
 	toolPolicyHash: string;
+	agentChosen?: string;
+	projectClass?: string;
 	ephemeral?: boolean;
 };
 
@@ -240,6 +242,9 @@ type ClaudeRegistryRecord = {
 	turns: number;
 	last_seen_message_count: number;
 	created_at: string;
+	system_prompt_hash: string;
+	agent_chosen?: string;
+	project_class?: string;
 };
 
 function piRoot(): string {
@@ -305,7 +310,7 @@ function readClaudeSessionRegistry(sessionKey: string): ClaudeRegistryRecord | u
 	if (!claudeSessionRegistryEnabled()) return undefined;
 	ensureClaudeSessionRegistry();
 	const rows = runClaudeRegistrySql(
-		`select claude_session_id, turns, last_seen_message_count, created_at from claude_sessions where session_key = ${sqlString(sessionKey)} limit 1;`,
+		`select claude_session_id, turns, last_seen_message_count, created_at, system_prompt_hash, agent_chosen, project_class from claude_sessions where session_key = ${sqlString(sessionKey)} limit 1;`,
 	);
 	if (!rows?.trim()) return undefined;
 	try {
@@ -317,6 +322,9 @@ function readClaudeSessionRegistry(sessionKey: string): ClaudeRegistryRecord | u
 			turns: Number.isFinite(row.turns) ? row.turns : 0,
 			last_seen_message_count: Number.isFinite(row.last_seen_message_count) ? row.last_seen_message_count : 0,
 			created_at: typeof row.created_at === "string" ? row.created_at : "",
+			system_prompt_hash: typeof row.system_prompt_hash === "string" ? row.system_prompt_hash : "",
+			agent_chosen: typeof row.agent_chosen === "string" ? row.agent_chosen : undefined,
+			project_class: typeof row.project_class === "string" ? row.project_class : undefined,
 		};
 	} catch {
 		return undefined;
@@ -335,7 +343,7 @@ insert into claude_sessions (
   last_seen_message_count, created_at, updated_at, last_status
 ) values (
   ${sqlString(session.sessionKey)}, ${sqlString(session.sessionId)}, 'claude-cli',
-  ${sqlString(session.model)}, null, ${sqlString(session.cwd)}, null, null, null,
+  ${sqlString(session.model)}, null, ${sqlString(session.cwd)}, ${session.projectClass ? sqlString(session.projectClass) : "null"}, ${session.agentChosen ? sqlString(session.agentChosen) : "null"}, null,
   ${sqlString(session.systemPromptHash)}, ${sqlString(session.toolPolicyHash)},
   ${session.turns}, ${session.seenMessageCount}, ${sqlString(now)}, ${sqlString(now)}, ${sqlString(status)}
 ) on conflict(session_key) do update set
@@ -392,6 +400,8 @@ function appendClaudeSessionTelemetry(
 				claude_session_boundary: {
 					cwd: session.cwd,
 					model: session.model,
+					agent_chosen: session.agentChosen,
+					project_class: session.projectClass,
 					system_prompt_hash: session.systemPromptHash,
 					tool_policy_hash: session.toolPolicyHash,
 				},
@@ -411,27 +421,52 @@ function appendClaudeSessionTelemetry(
  * present, or undefined when the prompt has no such marker (e.g. direct
  * claude-cli calls outside the router).
  */
-function extractRouterSessionMarker(systemPrompt: string | undefined): string | undefined {
+type RouterSessionMarker = {
+	raw: string;
+	agent?: string;
+	project?: string;
+};
+
+function extractRouterSessionMarker(systemPrompt: string | undefined): RouterSessionMarker | undefined {
 	const match = /<!-- pi-router-session ([^>]+) -->/.exec(systemPrompt ?? "");
-	return match ? match[1].trim() : undefined;
+	if (!match) return undefined;
+	const raw = match[1].trim();
+	const attrs = new Map<string, string>();
+	for (const attr of raw.matchAll(/([a-zA-Z_][\w-]*)="([^"]*)"/g)) {
+		attrs.set(attr[1], attr[2]);
+	}
+	return {
+		raw,
+		agent: attrs.get("agent") || undefined,
+		project: attrs.get("project") || undefined,
+	};
+}
+
+function routerWorkstreamIdentity(marker: RouterSessionMarker): string {
+	return marker.project ? `project:${marker.project}` : marker.raw;
+}
+
+function threadBoundaryId(options?: StreamOptions): string {
+	const tmuxPane = process.env.TMUX_PANE?.trim();
+	if (tmuxPane) return `pane:${tmuxPane}`;
+	return claudeSessionBoundaryId(options);
 }
 
 function stickySessionKey(model: Model<"claude-cli">, context: Context, options?: StreamOptions): string {
-	// When the router has injected a stable workstream-identity marker
-	// (`<!-- pi-router-session agent="..." project="..." -->`), use the
-	// marker as BOTH the boundary id AND the system-prompt hash component.
-	// Result: two different pi-mono processes (or the same process after
-	// restart) routing the same workstream produce the SAME session_key →
-	// SQLite registry hits → existing Claude session is resumed instead of
-	// a new one being spawned. Cross-pi-process workstream reuse, not just
-	// within-process. When no marker (direct claude-cli calls outside the
-	// router), fall back to the per-pi-mono-session boundary so unrelated
-	// pi processes don't accidentally share sessions.
+	// Router turns carry a marker with the current agent and project. Agent is
+	// loadability metadata, not continuity identity: a single user thread can
+	// move between specialists and should still resume the same Claude UUID.
+	// Keep continuity scoped to project + pane/session boundary, while storing
+	// the full system prompt hash separately for drift telemetry.
 	const marker = extractRouterSessionMarker(context.systemPrompt);
-	const sessionKey = marker ? `workstream:${digestText(marker)}` : claudeSessionBoundaryId(options);
-	const systemPromptHash = marker
-		? digestText(marker)
-		: digestText(stableSystemPromptForClaudeSession(context.systemPrompt));
+	const sessionKey = marker
+		? `workstream:${digestText(
+				JSON.stringify({
+					workstream: routerWorkstreamIdentity(marker),
+					thread: threadBoundaryId(options),
+				}),
+			)}`
+		: claudeSessionBoundaryId(options);
 	const toolPolicyHash = digestText(
 		JSON.stringify({
 			includeUserClaudeContext: includeUserClaudeContext(),
@@ -440,7 +475,7 @@ function stickySessionKey(model: Model<"claude-cli">, context: Context, options?
 			addDirs: ["Vault-V2", ".pi", "projects/ahlnos"],
 		}),
 	);
-	return [process.cwd(), sessionKey, model.id, systemPromptHash, toolPolicyHash].join("\n");
+	return [process.cwd(), sessionKey, model.id, toolPolicyHash].join("\n");
 }
 
 function claudeSessionBoundaryId(options?: StreamOptions): string {
@@ -458,9 +493,12 @@ function getStickySession(
 ): StickyClaudeSession | undefined {
 	if (!stickyClaudeSessionsEnabled()) return undefined;
 	const key = stickySessionKey(model, context, options);
-	const existing = stickySessions.get(key);
-	if (existing) return existing;
 	const metadata = claudeSessionMetadata(model, context, key);
+	const existing = stickySessions.get(key);
+	if (existing) {
+		refreshStickySessionMetadata(existing, metadata);
+		return existing;
+	}
 	const registryRecord = readClaudeSessionRegistry(key);
 	const rotation = registryRecord ? shouldRotateClaudeSession(registryRecord) : { rotate: false };
 	const useRegistry = registryRecord && !rotation.rotate;
@@ -470,7 +508,10 @@ function getStickySession(
 				sessionId: registryRecord.claude_session_id,
 				turns: registryRecord.turns,
 				seenMessageCount: registryRecord.last_seen_message_count,
-				reuseStatus: "resume" as const,
+				reuseStatus:
+					registryRecord.system_prompt_hash && registryRecord.system_prompt_hash !== metadata.systemPromptHash
+						? ("resumed-across-agents" as const)
+						: ("resume" as const),
 			}
 		: {
 				...metadata,
@@ -491,6 +532,17 @@ function getStickySession(
 			previousSessionId: registryRecord.claude_session_id,
 			previousTurns: registryRecord.turns,
 			previousCreatedAt: registryRecord.created_at,
+		});
+	}
+	if (
+		useRegistry &&
+		registryRecord.system_prompt_hash &&
+		registryRecord.system_prompt_hash !== session.systemPromptHash
+	) {
+		appendClaudeSessionTelemetry(session, "context_drift", {
+			previous_system_prompt_hash: registryRecord.system_prompt_hash,
+			previous_agent_chosen: registryRecord.agent_chosen,
+			previous_project_class: registryRecord.project_class,
 		});
 	}
 	upsertClaudeSessionRegistry(session, "ok");
@@ -515,6 +567,7 @@ function createEphemeralClaudeSession(
 }
 
 function claudeSessionMetadata(model: Model<"claude-cli">, context: Context, key: string) {
+	const marker = extractRouterSessionMarker(context.systemPrompt);
 	return {
 		sessionKey: key,
 		sessionKeyHash: digestText(key),
@@ -529,7 +582,31 @@ function claudeSessionMetadata(model: Model<"claude-cli">, context: Context, key
 				addDirs: ["Vault-V2", ".pi", "projects/ahlnos"],
 			}),
 		),
+		agentChosen: marker?.agent,
+		projectClass: marker?.project,
 	};
+}
+
+function refreshStickySessionMetadata(
+	session: StickyClaudeSession,
+	metadata: ReturnType<typeof claudeSessionMetadata>,
+): void {
+	const previousSystemPromptHash = session.systemPromptHash;
+	const previousAgentChosen = session.agentChosen;
+	const previousProjectClass = session.projectClass;
+	session.agentChosen = metadata.agentChosen;
+	session.projectClass = metadata.projectClass;
+	session.toolPolicyHash = metadata.toolPolicyHash;
+	if (previousSystemPromptHash !== metadata.systemPromptHash) {
+		session.systemPromptHash = metadata.systemPromptHash;
+		if (!session.ephemeral && session.turns > 0) session.reuseStatus = "resumed-across-agents";
+		appendClaudeSessionTelemetry(session, "context_drift", {
+			previous_system_prompt_hash: previousSystemPromptHash,
+			previous_agent_chosen: previousAgentChosen,
+			previous_project_class: previousProjectClass,
+		});
+		upsertClaudeSessionRegistry(session, "ok");
+	}
 }
 
 function stableSystemPromptForClaudeSession(systemPrompt?: string): string {
@@ -759,14 +836,17 @@ function buildClaudeInvocation(
 		`${home}/projects/ahlnos`,
 	);
 
-	const systemPrompt = !stickySession || stickySession.turns === 0 ? context.systemPrompt : undefined;
+	const systemPrompt = context.systemPrompt;
 	if (systemPrompt?.trim()) {
+		const promptArg = !stickySession || stickySession.turns === 0 ? "--system-prompt" : "--append-system-prompt";
+		const promptFileArg =
+			!stickySession || stickySession.turns === 0 ? "--system-prompt-file" : "--append-system-prompt-file";
 		if (shouldExternalizeClaudeArg(systemPrompt)) {
 			const systemPromptFile = writeClaudeArgTempFile("system-prompt.txt", systemPrompt);
 			tempFiles.push(systemPromptFile);
-			args.push("--system-prompt-file", systemPromptFile);
+			args.push(promptFileArg, systemPromptFile);
 		} else {
-			args.push("--system-prompt", systemPrompt);
+			args.push(promptArg, systemPrompt);
 		}
 	}
 
@@ -1058,15 +1138,17 @@ function createWorkerRequestState(input: {
 		if (event.type === "result") {
 			if (typeof event.result === "string" && finalText.length === 0) finalText = event.result;
 			finalUsage = usageFromClaudeResult(event);
+			const reuseStatus = input.stickySession.reuseStatus;
 			input.stickySession.turns += 1;
 			input.stickySession.seenMessageCount = input.nextSeenMessageCount;
-			input.stickySession.reuseStatus = "resume";
 			upsertClaudeSessionRegistry(input.stickySession, "ok");
 			appendClaudeSessionTelemetry(input.stickySession, "worker-result", {
+				reuse_status: reuseStatus,
 				response_model: responseModel,
 				usage_input_tokens: finalUsage?.input,
 				usage_output_tokens: finalUsage?.output,
 			});
+			input.stickySession.reuseStatus = "resume";
 			return true;
 		}
 		return false;
@@ -1104,6 +1186,7 @@ class ClaudeWorker {
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private tempFiles: string[] = [];
 	private stopped = false;
+	private readonly launchSystemPromptHash: string;
 	// Each entry counts a turn that was aborted by the caller while still in
 	// flight on claude. We keep the worker alive and discard claude's events
 	// for those turns until their `result` event arrives, which lets the next
@@ -1116,6 +1199,7 @@ class ClaudeWorker {
 		context: Context,
 		private readonly stickySession: StickyClaudeSession,
 	) {
+		this.launchSystemPromptHash = stickySession.systemPromptHash;
 		const invocation = buildClaudeInvocation(model, context, "", stickySession);
 		this.tempFiles = invocation.tempFiles;
 		const childEnv: NodeJS.ProcessEnv = { ...process.env };
@@ -1169,6 +1253,19 @@ class ClaudeWorker {
 	markStopped(): void {
 		this.stopped = true;
 		if (this.idleTimer) clearTimeout(this.idleTimer);
+	}
+
+	matchesSystemPromptHash(hash: string): boolean {
+		return this.launchSystemPromptHash === hash;
+	}
+
+	isIdle(): boolean {
+		return !this.pending && this.queue.length === 0;
+	}
+
+	async stopAndWait(timeoutMs = shutdownTimeoutMs()): Promise<void> {
+		this.stop();
+		await waitForChildExit(this.child, timeoutMs);
 	}
 
 	private onStdout(chunk: string): void {
@@ -1247,6 +1344,19 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, options?: St
 		const nextSeenMessageCount = latestUserIndex(context) + 2;
 		try {
 			let worker = claudeWorkers.get(stickySession.sessionKey);
+			if (worker?.isIdle() && !worker.matchesSystemPromptHash(stickySession.systemPromptHash)) {
+				appendClaudeSessionTelemetry(stickySession, "worker-restart-context-drift");
+				claudeWorkers.delete(stickySession.sessionKey);
+				return runClaudeCliAfterWorkerStop(
+					worker,
+					model,
+					context,
+					options,
+					stickySession,
+					prompt,
+					nextSeenMessageCount,
+				);
+			}
 			if (!worker) {
 				worker = new ClaudeWorker(model, context, stickySession);
 				claudeWorkers.set(stickySession.sessionKey, worker);
@@ -1268,6 +1378,44 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, options?: St
 		}
 	}
 	return runClaudeCliOneShot(model, context, options, stickySession);
+}
+
+function runClaudeCliAfterWorkerStop(
+	worker: ClaudeWorker,
+	model: Model<"claude-cli">,
+	context: Context,
+	options: StreamOptions | undefined,
+	stickySession: StickyClaudeSession,
+	prompt: string,
+	nextSeenMessageCount: number,
+) {
+	const outer = createAssistantMessageEventStream();
+	queueMicrotask(async () => {
+		try {
+			await worker.stopAndWait();
+			const replacement = new ClaudeWorker(model, context, stickySession);
+			claudeWorkers.set(stickySession.sessionKey, replacement);
+			let state: ClaudeRequestState;
+			state = createWorkerRequestState({
+				model,
+				options,
+				stickySession,
+				nextSeenMessageCount,
+				terminateWorker: () => replacement.stop(),
+				markAborted: () => replacement.abortPending(state),
+			});
+			const inner = replacement.request(prompt, state);
+			for await (const event of inner) {
+				outer.push(event);
+			}
+		} catch (err) {
+			const errorMessage = err instanceof Error ? err.message : String(err);
+			const message = buildAssistantMessage(model, "", "error", `claude-cli worker restart failed: ${errorMessage}`);
+			outer.push({ type: "error", reason: "error", error: message });
+			outer.end(message);
+		}
+	});
+	return outer;
 }
 
 function runClaudeCliOneShot(
@@ -1528,16 +1676,24 @@ function runClaudeCliOneShot(
 			finalUsage = usageFromClaudeResult(event);
 			if (stickySession) {
 				if (!stickySession.ephemeral) {
+					const reuseStatus = stickySession.reuseStatus;
 					stickySession.turns += 1;
 					stickySession.seenMessageCount = nextSeenMessageCount;
-					stickySession.reuseStatus = "resume";
 					upsertClaudeSessionRegistry(stickySession, "ok");
+					appendClaudeSessionTelemetry(stickySession, "result", {
+						reuse_status: reuseStatus,
+						response_model: responseModel,
+						usage_input_tokens: finalUsage?.input,
+						usage_output_tokens: finalUsage?.output,
+					});
+					stickySession.reuseStatus = "resume";
+				} else {
+					appendClaudeSessionTelemetry(stickySession, "result", {
+						response_model: responseModel,
+						usage_input_tokens: finalUsage?.input,
+						usage_output_tokens: finalUsage?.output,
+					});
 				}
-				appendClaudeSessionTelemetry(stickySession, "result", {
-					response_model: responseModel,
-					usage_input_tokens: finalUsage?.input,
-					usage_output_tokens: finalUsage?.output,
-				});
 			}
 		}
 	};
