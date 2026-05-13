@@ -73,6 +73,26 @@ export interface ProviderResponse {
 	headers: Record<string, string>;
 }
 
+export interface UserQuestionOption {
+	label: string;
+	description?: string;
+}
+
+export interface UserQuestion {
+	header?: string;
+	question: string;
+	options: UserQuestionOption[];
+	multiSelect?: boolean;
+}
+
+export interface UserQuestionRequest {
+	provider?: string;
+	toolName?: string;
+	text: string;
+	questions: UserQuestion[];
+	rawInput?: unknown;
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	maxTokens?: number;
@@ -104,6 +124,15 @@ export interface StreamOptions {
 	 * its body stream is consumed.
 	 */
 	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
+	/**
+	 * Optional callback for provider-native user question prompts. Providers that
+	 * support an interactive prompt protocol can call this and continue with the
+	 * returned answer; providers that do not support it ignore the callback.
+	 */
+	onUserQuestion?: (
+		request: UserQuestionRequest,
+		model: Model<Api>,
+	) => string | undefined | Promise<string | undefined>;
 	/**
 	 * Optional custom HTTP headers to include in API requests.
 	 * Merged with provider defaults; can override default headers.

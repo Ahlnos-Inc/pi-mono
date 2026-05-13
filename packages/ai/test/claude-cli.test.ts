@@ -296,6 +296,56 @@ describe("claude-cli provider", () => {
 		expect(done.message.content).toEqual([{ type: "text", text: "second" }]);
 	});
 
+	it("answers Claude AskUserQuestion prompts through a long-lived worker", async () => {
+		process.env.PI_CLAUDE_CLI_WORKERS = "1";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(child);
+		let capturedQuestion = "";
+
+		const stream = streamClaudeCli(model, context("same system"), {
+			onUserQuestion: async (request) => {
+				capturedQuestion = request.questions[0]?.question ?? "";
+				return "User answered the previous question: Choose A.";
+			},
+		});
+		const eventsPromise = collectEvents(stream);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "toolu_1", name: "AskUserQuestion" },
+				},
+			},
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_delta",
+					index: 0,
+					delta: {
+						type: "input_json_delta",
+						partial_json:
+							'{"questions":[{"question":"Choose a path","options":[{"label":"A","description":"small"},{"label":"B"}]}]}',
+					},
+				},
+			},
+			{ type: "result", subtype: "success", result: "intermediate auto-denial", usage: {} },
+		]);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(capturedQuestion).toBe("Choose a path");
+		expect(userEnvelopePayloads(child)).toEqual(["hello", "User answered the previous question: Choose A."]);
+
+		writeJsonl(child, [{ type: "result", subtype: "success", result: "final after answer", usage: {} }]);
+		const events = await eventsPromise;
+		const done = events.find((event) => event.type === "done");
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "final after answer" }]);
+	});
+
 	it("keeps a long-lived worker when only prompt-scoped Pi retrieval changes", async () => {
 		process.env.PI_CLAUDE_CLI_WORKERS = "1";
 		const child = new MockChildProcess();

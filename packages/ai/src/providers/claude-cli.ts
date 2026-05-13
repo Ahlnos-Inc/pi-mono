@@ -14,6 +14,7 @@ import type {
 	StreamOptions,
 	TextContent,
 	Usage,
+	UserQuestionRequest,
 } from "../types.js";
 import { createAssistantMessageEventStream } from "../utils/event-stream.js";
 
@@ -951,6 +952,13 @@ type ClaudeCliContentBlockState =
 	| { type: "tool_use"; id?: string; name?: string; inputJson: string; announcedInput: boolean }
 	| { type: string; name?: string; text?: string; inputJson?: string; announcedInput?: boolean };
 
+type ClaudePromptBridgeState = {
+	pendingPrompts: number;
+	resultsToIgnore: number;
+	awaitingFollowupResult: boolean;
+	answersSent: number;
+};
+
 function parseJsonLine(line: string): ClaudeCliJson | undefined {
 	const trimmed = line.trim();
 	if (!trimmed) return undefined;
@@ -1023,12 +1031,19 @@ function stringValue(record: Record<string, unknown>, keys: string[]): string | 
 }
 
 function optionLabel(option: unknown): string | undefined {
-	if (typeof option === "string" && option.trim()) return option.trim();
+	const details = optionDetails(option);
+	if (!details) return undefined;
+	return details.description ? `${details.label} - ${details.description}` : details.label;
+}
+
+function optionDetails(option: unknown): { label: string; description?: string } | undefined {
+	if (typeof option === "string" && option.trim()) return { label: option.trim() };
 	if (!option || typeof option !== "object") return undefined;
 	const record = option as Record<string, unknown>;
 	const label = stringValue(record, ["label", "value", "text", "title", "name"]);
 	const description = stringValue(record, ["description", "hint"]);
-	return description && label ? `${label} - ${description}` : label;
+	if (!label) return undefined;
+	return description ? { label, description } : { label };
 }
 
 function formatOptions(options: unknown): string[] {
@@ -1042,6 +1057,47 @@ function formatClaudeQuestion(record: Record<string, unknown>): string | undefin
 	const options = formatOptions(record.options ?? record.choices);
 	if (options.length === 0) return prompt;
 	return [prompt, "", ...options.map((option) => `- ${option}`)].join("\n");
+}
+
+function claudeUserQuestionRequest(toolName: string | undefined, input: unknown): UserQuestionRequest | undefined {
+	if (toolName !== "AskUserQuestion" || !input || typeof input !== "object" || Array.isArray(input)) {
+		return undefined;
+	}
+	const record = input as Record<string, unknown>;
+	const rawQuestions = Array.isArray(record.questions) && record.questions.length > 0 ? record.questions : [record];
+	const questions: UserQuestionRequest["questions"] = [];
+	for (const question of rawQuestions) {
+		if (!question || typeof question !== "object" || Array.isArray(question)) continue;
+		const questionRecord = question as Record<string, unknown>;
+		const prompt = stringValue(questionRecord, ["question", "prompt", "message", "text"]);
+		if (!prompt) continue;
+		const optionsRaw = questionRecord.options ?? questionRecord.choices;
+		const options = Array.isArray(optionsRaw)
+			? optionsRaw.map(optionDetails).filter(
+					(
+						value,
+					): value is {
+						label: string;
+						description?: string;
+					} => !!value,
+				)
+			: [];
+		const header = stringValue(questionRecord, ["header", "title", "label"]);
+		questions.push({
+			...(header ? { header } : {}),
+			question: prompt,
+			options,
+			multiSelect: questionRecord.multiSelect === true || questionRecord.multiselect === true,
+		});
+	}
+	if (questions.length === 0) return undefined;
+	return {
+		provider: "claude-cli",
+		toolName,
+		text: claudeUserFacingToolText(toolName, input) ?? questions.map((question) => question.question).join("\n\n"),
+		questions,
+		rawInput: record,
+	};
 }
 
 function claudeUserFacingToolText(toolName: string | undefined, input: unknown): string | undefined {
@@ -1087,10 +1143,11 @@ type ClaudeRequestState = {
 
 function createWorkerRequestState(input: {
 	model: Model<"claude-cli">;
-	options?: { signal?: AbortSignal; timeoutMs?: number };
+	options?: StreamOptions;
 	stickySession: StickyClaudeSession;
 	nextSeenMessageCount: number;
 	terminateWorker: () => void;
+	sendUserInput?: (text: string) => boolean;
 	markAborted?: () => void;
 }): ClaudeRequestState {
 	const stream = createAssistantMessageEventStream();
@@ -1105,6 +1162,12 @@ function createWorkerRequestState(input: {
 	const blocks = new Map<number, ClaudeCliContentBlockState>();
 	const partial: AssistantMessage = buildAssistantMessage(input.model, "", "stop");
 	const emitActivityText = claudeActivityTextEnabled();
+	const promptBridge: ClaudePromptBridgeState = {
+		pendingPrompts: 0,
+		resultsToIgnore: 0,
+		awaitingFollowupResult: false,
+		answersSent: 0,
+	};
 
 	const updateDisplay = (nextText: string, delta: string) => {
 		resetIdleTimer();
@@ -1134,19 +1197,67 @@ function createWorkerRequestState(input: {
 
 	const announceToolInput = (block: ClaudeCliContentBlockState) => {
 		if (block.type !== "tool_use" || block.announcedInput) return;
-		const input = parseToolInputJson(block.inputJson);
-		const userFacingText = claudeUserFacingToolText(block.name, input);
+		const toolInput = parseToolInputJson(block.inputJson);
+		const questionRequest = claudeUserQuestionRequest(block.name, toolInput);
+		if (questionRequest && input.options?.onUserQuestion && input.sendUserInput) {
+			block.announcedInput = true;
+			void answerClaudeUserQuestion(questionRequest);
+			return;
+		}
+		const userFacingText = claudeUserFacingToolText(block.name, toolInput);
 		if (userFacingText) {
 			appendUserFacingToolText(userFacingText);
 			block.announcedInput = true;
 			return;
 		}
-		if (input) {
-			const summary = summarizeToolInput(block.name, input);
+		if (toolInput) {
+			const summary = summarizeToolInput(block.name, toolInput);
 			appendActivity(summary ? `running ${block.name}: ${summary}` : `running ${block.name}`);
 			block.announcedInput = true;
 		}
 	};
+
+	async function answerClaudeUserQuestion(request: UserQuestionRequest): Promise<void> {
+		promptBridge.pendingPrompts += 1;
+		promptBridge.resultsToIgnore = Math.max(promptBridge.resultsToIgnore, 1);
+		try {
+			const answer = await input.options?.onUserQuestion?.(request, input.model);
+			promptBridge.pendingPrompts = Math.max(0, promptBridge.pendingPrompts - 1);
+			const response = answer?.trim()
+				? answer
+				: [
+						"The user dismissed the previous Claude AskUserQuestion prompt.",
+						"Continue without that answer. Do not treat the AskUserQuestion tool denial as a user cancellation.",
+					].join("\n");
+			if (input.sendUserInput?.(response)) {
+				promptBridge.answersSent += 1;
+				promptBridge.awaitingFollowupResult = true;
+			}
+		} catch {
+			promptBridge.pendingPrompts = Math.max(0, promptBridge.pendingPrompts - 1);
+			const response = [
+				"The user question prompt could not be answered by Pi.",
+				"Continue without that answer. Do not treat the AskUserQuestion tool denial as a user cancellation.",
+			].join("\n");
+			if (input.sendUserInput?.(response)) {
+				promptBridge.answersSent += 1;
+				promptBridge.awaitingFollowupResult = true;
+			}
+		}
+	}
+
+	function shouldDeferPromptBridgeResult(): boolean {
+		if (promptBridge.resultsToIgnore > 0) {
+			promptBridge.resultsToIgnore -= 1;
+			return true;
+		}
+		if (promptBridge.pendingPrompts > 0) return true;
+		if (promptBridge.awaitingFollowupResult) {
+			promptBridge.awaitingFollowupResult = false;
+			return false;
+		}
+		return false;
+	}
 
 	function resetIdleTimer() {
 		if (idleTimer) clearTimeout(idleTimer);
@@ -1309,6 +1420,7 @@ function createWorkerRequestState(input: {
 		}
 
 		if (event.type === "result") {
+			if (shouldDeferPromptBridgeResult()) return false;
 			if (typeof event.result === "string" && finalText.length === 0) finalText = event.result;
 			finalUsage = usageFromClaudeResult(event);
 			const reuseStatus = input.stickySession.reuseStatus;
@@ -1481,6 +1593,12 @@ class ClaudeWorker {
 		if (queuedIdx !== -1) this.queue.splice(queuedIdx, 1);
 	}
 
+	sendUserInput(state: ClaudeRequestState, text: string): boolean {
+		if (this.pending?.state !== state || this.stopped) return false;
+		this.child.stdin?.write(claudeUserInputJsonl(text));
+		return true;
+	}
+
 	private pump(): void {
 		if (this.pending || this.queue.length === 0) return;
 		if (this.idleTimer) clearTimeout(this.idleTimer);
@@ -1537,6 +1655,7 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, options?: St
 				stickySession,
 				nextSeenMessageCount,
 				terminateWorker: () => worker?.stop(),
+				sendUserInput: (text) => (worker ? worker.sendUserInput(state, text) : false),
 				markAborted: () => worker?.abortPending(state),
 			});
 			return worker.request(prompt, state);
@@ -1572,6 +1691,7 @@ function runClaudeCliAfterWorkerStop(
 				stickySession,
 				nextSeenMessageCount,
 				terminateWorker: () => replacement.stop(),
+				sendUserInput: (text) => replacement.sendUserInput(state, text),
 				markAborted: () => replacement.abortPending(state),
 			});
 			const inner = replacement.request(prompt, state);

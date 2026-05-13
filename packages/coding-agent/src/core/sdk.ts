@@ -1,6 +1,13 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
+import {
+	clampThinkingLevel,
+	type Message,
+	type Model,
+	streamSimple,
+	type UserQuestion,
+	type UserQuestionRequest,
+} from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
@@ -153,6 +160,65 @@ function getAttributionHeaders(
 	}
 
 	return undefined;
+}
+
+function formatUserQuestionTitle(question: UserQuestion, index: number, total: number): string {
+	const header = question.header ? `${question.header}: ` : "";
+	const prefix = total > 1 ? `Question ${index + 1}/${total}` : "Question";
+	return `${prefix}\n\n${header}${question.question}`;
+}
+
+function formatUserQuestionOption(option: UserQuestion["options"][number]): string {
+	return option.description ? `${option.label} - ${option.description}` : option.label;
+}
+
+async function answerUserQuestionViaExtensionUi(
+	request: UserQuestionRequest,
+	runner: ExtensionRunner | undefined,
+): Promise<string | undefined> {
+	if (!runner?.hasUI()) return undefined;
+	const ui = runner.getUIContext();
+	const answers: string[] = [];
+	for (let index = 0; index < request.questions.length; index += 1) {
+		const question = request.questions[index];
+		const title = formatUserQuestionTitle(question, index, request.questions.length);
+		let answer: string | undefined;
+		if (question.options.length > 0 && !question.multiSelect) {
+			answer = await ui.select(title, question.options.map(formatUserQuestionOption));
+		} else {
+			const placeholder =
+				question.options.length > 0
+					? `Answer with one or more options: ${question.options.map((option) => option.label).join(", ")}`
+					: "Type your answer";
+			answer = await ui.input(
+				question.options.length > 0
+					? `${title}\n\n${question.options.map((option) => `- ${formatUserQuestionOption(option)}`).join("\n")}`
+					: title,
+				placeholder,
+			);
+		}
+		const normalizedAnswer = answer?.trim();
+		if (!normalizedAnswer) {
+			ui.notify("Question dismissed; continuing without an answer.", "warning");
+			return [
+				"The user dismissed the previous question prompt.",
+				"Continue without that answer. Do not treat the provider-side prompt denial as a user cancellation.",
+			].join("\n");
+		}
+		answers.push(
+			[
+				`${index + 1}. ${question.header ? `${question.header}: ` : ""}${question.question}`,
+				`Answer: ${normalizedAnswer}`,
+			].join("\n"),
+		);
+	}
+	return [
+		"User answered the previous question prompt:",
+		"",
+		...answers,
+		"",
+		"Continue from these answers. Do not treat the provider-side prompt denial as a user cancellation.",
+	].join("\n");
 }
 
 /**
@@ -338,6 +404,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				onUserQuestion: async (request, questionModel) => {
+					const answer = await options?.onUserQuestion?.(request, questionModel);
+					return answer ?? answerUserQuestionViaExtensionUi(request, extensionRunnerRef.current);
+				},
 				headers:
 					attributionHeaders || auth.headers || options?.headers
 						? { ...attributionHeaders, ...auth.headers, ...options?.headers }
