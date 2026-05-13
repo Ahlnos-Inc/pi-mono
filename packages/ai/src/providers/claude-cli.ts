@@ -62,6 +62,18 @@ const MAX_CLAUDE_DYNAMIC_ARG_BYTES = 64 * 1024;
 const VOLATILE_SYSTEM_PROMPT_BLOCK_RE =
 	/<!-- pi-router: retrieved (?:context|memory) -->[\s\S]*?<!-- \/pi-router: retrieved (?:context|memory) -->/g;
 
+/**
+ * `reuseStatus` records *how* a Claude CLI session was acquired (its origin
+ * tag). `livePhase` records what the session is *currently doing*. The TUI
+ * header reads `livePhase` first, so the user sees "Working" / "Awaiting
+ * input" during the body of a turn — and only sees adoption verbs like
+ * "Resuming session" or "Replacing stale session" during the brief
+ * pre-first-stream window when those are actually true. Without this split
+ * the adoption-time origin tag leaked into the entire subprocess lifetime
+ * and made the status bar lie about whose turn it was.
+ */
+type ClaudeSessionLivePhase = "adopting" | "working" | "idle";
+
 type StickyClaudeSession = {
 	sessionKey: string;
 	sessionKeyHash: string;
@@ -69,6 +81,10 @@ type StickyClaudeSession = {
 	turns: number;
 	seenMessageCount: number;
 	reuseStatus: "new" | "resume" | "resumed-across-agents" | "disabled" | "stale-recreated" | "ephemeral";
+	livePhase: ClaudeSessionLivePhase;
+	/** Most recent tool count reported by Claude's system.init event, so idle
+	 * status pushes can still report "N tools" without re-querying. */
+	lastToolCount?: number;
 	model: string;
 	cwd: string;
 	systemPromptHash: string;
@@ -248,6 +264,8 @@ function rotateStickyClaudeSession(session: StickyClaudeSession, reason: string)
 	const previousSessionId = session.sessionId;
 	stickySessions.delete(session.sessionKey);
 	session.reuseStatus = "stale-recreated";
+	session.livePhase = "adopting";
+	session.lastToolCount = undefined;
 	session.turns = 0;
 	session.seenMessageCount = 0;
 	session.sessionId = uuidFromKey(`pi-claude-cli\n${session.sessionKey}\nrecovered\n${Date.now()}\n${randomUUID()}`);
@@ -613,7 +631,7 @@ function getStickySession(
 	const registryRecord = readClaudeSessionRegistry(key);
 	const rotation = registryRecord ? shouldRotateClaudeSession(registryRecord) : { rotate: false };
 	const useRegistry = registryRecord && !rotation.rotate;
-	const session = useRegistry
+	const session: StickyClaudeSession = useRegistry
 		? {
 				...metadata,
 				sessionId: registryRecord.claude_session_id,
@@ -623,6 +641,7 @@ function getStickySession(
 					registryRecord.system_prompt_hash && registryRecord.system_prompt_hash !== metadata.systemPromptHash
 						? ("resumed-across-agents" as const)
 						: ("resume" as const),
+				livePhase: "adopting",
 			}
 		: {
 				...metadata,
@@ -636,6 +655,7 @@ function getStickySession(
 				turns: 0,
 				seenMessageCount: 0,
 				reuseStatus: rotation.rotate ? ("stale-recreated" as const) : ("new" as const),
+				livePhase: "adopting",
 			};
 	if (rotation.rotate && registryRecord) {
 		appendClaudeSessionTelemetry(session, "rotated", {
@@ -673,6 +693,7 @@ function createEphemeralClaudeSession(
 		turns: 0,
 		seenMessageCount: 0,
 		reuseStatus: "ephemeral",
+		livePhase: "adopting",
 		ephemeral: true,
 	};
 }
@@ -1151,6 +1172,13 @@ function activityLine(text: string): string {
 }
 
 function claudeSessionStatusVerb(session: StickyClaudeSession): string {
+	// `livePhase` reflects what the session is doing right now and wins over
+	// the origin-tagged `reuseStatus`. Adoption verbs ("Resuming session",
+	// "Replacing stale session", etc.) only describe the moment a session is
+	// being created or recovered — once Claude is actively generating, or once
+	// the turn has ended, those verbs are stale and misleading.
+	if (session.livePhase === "working") return "Working";
+	if (session.livePhase === "idle") return "Awaiting input";
 	switch (session.reuseStatus) {
 		case "resume":
 			return "Resuming session";
@@ -1180,12 +1208,16 @@ function claudeSessionStatusMessage(
 	toolCount?: number | undefined,
 ): string {
 	const shortId = session.sessionId.slice(0, 8);
+	// Prefer an explicitly-supplied tool count (we just saw a system.init event),
+	// otherwise reuse the last one Claude reported on this session so the idle
+	// status still surfaces "27 tools" without re-querying.
+	const resolvedToolCount = toolCount ?? session.lastToolCount;
 	const groups = [
 		"Claude CLI",
 		claudeSessionStatusVerb(session),
 		shortId,
 		compactClaudeModelId(modelId),
-		toolCount === undefined ? undefined : `${toolCount} tool${toolCount === 1 ? "" : "s"}`,
+		resolvedToolCount === undefined ? undefined : `${resolvedToolCount} tool${resolvedToolCount === 1 ? "" : "s"}`,
 	].filter((value): value is string => typeof value === "string" && value.length > 0);
 	return groups.join("  ");
 }
@@ -1252,12 +1284,13 @@ function createWorkerRequestState(input: {
 		updateDisplay(displayText + line, line);
 	};
 
-	const pushProviderStatus = (message: string) => {
+	const pushProviderStatus = (message: string, opts?: { idle?: boolean }) => {
 		stream.push({
 			type: "status",
 			source: "claude-cli",
 			statusKey: "claude-cli.session",
 			message,
+			...(opts?.idle ? { idle: true } : {}),
 			partial: { ...partial, content: [{ type: "text", text: displayText }] },
 		});
 	};
@@ -1415,9 +1448,15 @@ function createWorkerRequestState(input: {
 			if (event.subtype === "init") {
 				responseModel = typeof event.model === "string" ? event.model : responseModel;
 				const toolCount = Array.isArray(event.tools) ? event.tools.length : undefined;
+				if (toolCount !== undefined) input.stickySession.lastToolCount = toolCount;
 				const reusing = input.stickySession.turns > 0;
 				const shortId = `${input.stickySession.sessionId.slice(0, 8)}…`;
 				const verb = reusing ? `resumed (${shortId})` : "initialized";
+				// Adoption is done — Claude has bound the session and is now actively
+				// processing the prompt. Flip to "working" so the header reads
+				// "Working" instead of leaving "Initializing session" / "Replacing
+				// stale session" pinned for the rest of the turn.
+				input.stickySession.livePhase = "working";
 				pushProviderStatus(
 					claudeSessionStatusMessage(input.stickySession, event.model ?? input.model.id, toolCount),
 				);
@@ -1433,6 +1472,14 @@ function createWorkerRequestState(input: {
 			if (streamEvent.type === "message_start") {
 				const messageModel = streamEvent.message?.model;
 				if (typeof messageModel === "string") responseModel = messageModel;
+				// Reused workers (turn 2+ on the same subprocess) do not re-emit
+				// `system.init`, so `message_start` is the earliest reliable signal
+				// that Claude is generating again. Flip to "working" here too;
+				// re-push the status only when we actually had to change phase.
+				if (input.stickySession.livePhase !== "working") {
+					input.stickySession.livePhase = "working";
+					pushProviderStatus(claudeSessionStatusMessage(input.stickySession, responseModel ?? input.model.id));
+				}
 				appendActivity(`model turn started (${responseModel ?? input.model.id})`);
 				return false;
 			}
@@ -1528,6 +1575,14 @@ function createWorkerRequestState(input: {
 				usage_output_tokens: finalUsage?.output,
 			});
 			input.stickySession.reuseStatus = "resume";
+			// Turn complete: the worker subprocess stays alive but Claude is no
+			// longer doing work — it's the user's turn now. Surface that as a
+			// non-spinning "Awaiting input" status so the TUI stops animating and
+			// stops appending elapsed-time / "press X to interrupt" suffixes.
+			input.stickySession.livePhase = "idle";
+			pushProviderStatus(claudeSessionStatusMessage(input.stickySession, responseModel ?? input.model.id), {
+				idle: true,
+			});
 			return true;
 		}
 		return false;
@@ -1536,6 +1591,13 @@ function createWorkerRequestState(input: {
 	stream.push({ type: "start", partial });
 	partial.content = [{ type: "text", text: "" }];
 	stream.push({ type: "text_start", contentIndex: 0, partial: { ...partial, content: [{ type: "text", text: "" }] } });
+	// Reset livePhase to "adopting" at the start of each request so the initial
+	// status push reflects the adoption-flavor verb ("Resuming session",
+	// "Replacing stale session", etc.) for the brief pre-stream window. On a
+	// reused worker the previous turn left livePhase = "idle"; without this
+	// reset the very first push of the new turn would still read "Awaiting
+	// input" even though Claude has just been re-dispatched.
+	input.stickySession.livePhase = "adopting";
 	pushProviderStatus(claudeSessionStatusMessage(input.stickySession, input.model.id));
 	resetIdleTimer();
 	if (maxRuntimeMs !== undefined) {
@@ -1918,17 +1980,24 @@ function runClaudeCliOneShot(
 	partial.content = [{ type: "text", text: "" }];
 	stream.push({ type: "text_start", contentIndex: 0, partial: { ...partial, content: [{ type: "text", text: "" }] } });
 
-	const pushProviderStatus = (message: string) => {
+	const pushProviderStatus = (message: string, opts?: { idle?: boolean }) => {
 		stream.push({
 			type: "status",
 			source: "claude-cli",
 			statusKey: "claude-cli.session",
 			message,
+			...(opts?.idle ? { idle: true } : {}),
 			partial: { ...partial, content: [{ type: "text", text: displayText }] },
 		});
 	};
 
-	if (stickySession) pushProviderStatus(claudeSessionStatusMessage(stickySession, model.id));
+	if (stickySession) {
+		// One-shot path is always adoption-first: the child is spawned fresh and
+		// will emit `system.init` before any model output, at which point we flip
+		// to "working". On `result` we flip to "idle".
+		stickySession.livePhase = "adopting";
+		pushProviderStatus(claudeSessionStatusMessage(stickySession, model.id));
+	}
 
 	child.stdout?.setEncoding("utf8");
 	child.stderr?.setEncoding("utf8");
@@ -1981,11 +2050,15 @@ function runClaudeCliOneShot(
 			if (event.subtype === "init") {
 				responseModel = typeof event.model === "string" ? event.model : responseModel;
 				const toolCount = Array.isArray(event.tools) ? event.tools.length : undefined;
+				if (stickySession && toolCount !== undefined) stickySession.lastToolCount = toolCount;
 				const reusing = stickySession ? stickySession.turns > 0 : false;
 				const shortId = stickySession ? `${stickySession.sessionId.slice(0, 8)}…` : "";
 				const verb = reusing ? `resumed (${shortId})` : "initialized";
-				if (stickySession)
+				if (stickySession) {
+					// Adoption done — Claude is now actively working on the prompt.
+					stickySession.livePhase = "working";
 					pushProviderStatus(claudeSessionStatusMessage(stickySession, event.model ?? model.id, toolCount));
+				}
 				appendActivity(toolCount ? `${verb} ${event.model ?? model.id} with ${toolCount} tools` : verb);
 			} else if (event.subtype === "status" && typeof event.status === "string") {
 				appendActivity(event.status === "requesting" ? "requesting model response" : event.status);
@@ -1999,6 +2072,10 @@ function runClaudeCliOneShot(
 				sawClaudeSessionActivity = true;
 				const messageModel = streamEvent.message?.model;
 				if (typeof messageModel === "string") responseModel = messageModel;
+				if (stickySession && stickySession.livePhase !== "working") {
+					stickySession.livePhase = "working";
+					pushProviderStatus(claudeSessionStatusMessage(stickySession, responseModel ?? model.id));
+				}
 				appendActivity(`model turn started (${responseModel ?? model.id})`);
 				return;
 			}
@@ -2108,6 +2185,12 @@ function runClaudeCliOneShot(
 						usage_output_tokens: finalUsage?.output,
 					});
 				}
+				// Turn complete: flip to idle and emit a non-spinning idle status.
+				// The one-shot child will exit shortly after this; the idle push
+				// is mostly belt-and-suspenders, but it keeps the live-phase model
+				// consistent with the worker path for downstream consumers.
+				stickySession.livePhase = "idle";
+				pushProviderStatus(claudeSessionStatusMessage(stickySession, responseModel ?? model.id), { idle: true });
 			}
 		}
 	};

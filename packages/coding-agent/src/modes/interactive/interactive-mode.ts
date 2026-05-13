@@ -271,6 +271,12 @@ export class InteractiveMode {
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private providerWorkingMessage: string | undefined = undefined;
+	// When true, the provider's most recent status was an "idle / awaiting input"
+	// signal (e.g. a Claude CLI worker is alive between turns). The loader is
+	// then rendered without spinner and without the cumulative-elapsed /
+	// "press X to interrupt" suffix so the header does not lie about whose turn
+	// it is.
+	private providerWorkingIdle = false;
 	private workingStartedAtMs: number | undefined = undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
@@ -1701,6 +1707,14 @@ export class InteractiveMode {
 	private getProviderWorkingLoaderMessage(): (() => string) | undefined {
 		if (!this.providerWorkingMessage) return undefined;
 		return () => {
+			if (this.providerWorkingIdle) {
+				// Idle: the provider's session is alive but is not doing work right
+				// now (e.g. a Claude CLI worker awaiting the next prompt). Show the
+				// provider's idle message verbatim — no elapsed-time suffix and no
+				// "press X to interrupt" affordance, both of which would imply
+				// activity that isn't happening.
+				return this.providerWorkingMessage ?? "";
+			}
 			const startedAt = this.workingStartedAtMs;
 			const elapsed = startedAt ? ` · ${formatElapsed(Date.now() - startedAt)}` : "";
 			return `${this.providerWorkingMessage}${elapsed} · ${keyText("app.interrupt")} to interrupt`;
@@ -1752,9 +1766,18 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private setProviderWorkingMessage(message: string | undefined): void {
+	private setProviderWorkingMessage(message: string | undefined, options?: { idle?: boolean }): void {
 		this.providerWorkingMessage = message;
+		this.providerWorkingIdle = !!options?.idle && !!message;
 		if (this.loadingAnimation && !this.workingMessage) {
+			// Idle status: render with no spinner frames so the loader becomes a
+			// static label. Non-idle: restore the default animated spinner unless
+			// the user/extension has set a custom indicator.
+			if (this.providerWorkingIdle) {
+				this.loadingAnimation.setIndicator({ frames: [] });
+			} else {
+				this.loadingAnimation.setIndicator(this.workingIndicatorOptions);
+			}
 			this.loadingAnimation.setMessage(this.getWorkingLoaderMessage());
 		}
 	}
@@ -1853,6 +1876,7 @@ export class InteractiveMode {
 		this.updateTerminalTitle();
 		this.workingMessage = undefined;
 		this.providerWorkingMessage = undefined;
+		this.providerWorkingIdle = false;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
 		if (this.loadingAnimation) {
@@ -2765,6 +2789,7 @@ export class InteractiveMode {
 				this.pendingTools.clear();
 				this.workingStartedAtMs = Date.now();
 				this.providerWorkingMessage = undefined;
+				this.providerWorkingIdle = false;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -2832,7 +2857,9 @@ export class InteractiveMode {
 
 			case "message_update":
 				if (event.assistantMessageEvent.type === "status") {
-					this.setProviderWorkingMessage(event.assistantMessageEvent.message);
+					this.setProviderWorkingMessage(event.assistantMessageEvent.message, {
+						idle: event.assistantMessageEvent.idle === true,
+					});
 					break;
 				}
 				if (this.streamingComponent && event.message.role === "assistant") {
@@ -2954,6 +2981,7 @@ export class InteractiveMode {
 			case "agent_end":
 				this.workingStartedAtMs = undefined;
 				this.providerWorkingMessage = undefined;
+				this.providerWorkingIdle = false;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}

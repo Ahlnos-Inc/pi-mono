@@ -298,7 +298,21 @@ export interface Context {
  */
 export type AssistantMessageEvent =
 	| { type: "start"; partial: AssistantMessage }
-	| { type: "status"; source?: string; statusKey?: string; message: string; partial: AssistantMessage }
+	| {
+			type: "status";
+			source?: string;
+			statusKey?: string;
+			message: string;
+			/**
+			 * When true, the provider has reported that its session is alive but not
+			 * currently doing work (e.g. a long-lived Claude CLI worker is awaiting
+			 * the next user prompt). UIs should treat this as a quiet/idle state:
+			 * stop spinner animation, drop "press X to interrupt" affordances, and
+			 * suppress cumulative elapsed-time suffixes.
+			 */
+			idle?: boolean;
+			partial: AssistantMessage;
+	  }
 	| { type: "text_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "text_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "text_end"; contentIndex: number; content: string; partial: AssistantMessage }
