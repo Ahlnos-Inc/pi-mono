@@ -346,6 +346,78 @@ describe("claude-cli provider", () => {
 		expect(done.message.content).toEqual([{ type: "text", text: "final after answer" }]);
 	});
 
+	it("suppresses intermediate dismissed text while waiting for AskUserQuestion answers", async () => {
+		process.env.PI_CLAUDE_CLI_WORKERS = "1";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValueOnce(child);
+		let resolveQuestion!: (answer: string) => void;
+		const questionAnswer = new Promise<string>((resolve) => {
+			resolveQuestion = resolve;
+		});
+
+		const stream = streamClaudeCli(model, context("same system"), {
+			onUserQuestion: async () => questionAnswer,
+		});
+		const eventsPromise = collectEvents(stream);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "toolu_1", name: "AskUserQuestion" },
+				},
+			},
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "input_json_delta", partial_json: '{"question":"Choose a path","options":["A","B"]}' },
+				},
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 1, content_block: { type: "text" } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Dismissed again." } },
+			},
+			{ type: "result", subtype: "success", result: "dismissed result", usage: {} },
+		]);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(userEnvelopePayloads(child)).toEqual(["hello"]);
+
+		resolveQuestion("User answered the previous question: Choose A.");
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(userEnvelopePayloads(child)).toEqual(["hello", "User answered the previous question: Choose A."]);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
+			},
+			{
+				type: "stream_event",
+				event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Got your answers." } },
+			},
+			{ type: "result", subtype: "success", result: "Got your answers.", usage: {} },
+		]);
+		const events = await eventsPromise;
+		const rendered = events
+			.filter((event) => event.type === "text_delta")
+			.map((event) => (event.type === "text_delta" ? event.delta : ""))
+			.join("");
+		expect(rendered).toContain("Got your answers.");
+		expect(rendered).not.toContain("Dismissed again.");
+		const done = events.find((event) => event.type === "done");
+		expect(done?.type).toBe("done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "Got your answers." }]);
+	});
+
 	it("continues AskUserQuestion prompts without telling Claude the user cancelled when no answer is captured", async () => {
 		process.env.PI_CLAUDE_CLI_WORKERS = "1";
 		const child = new MockChildProcess();

@@ -947,7 +947,7 @@ function buildClaudeInvocation(
 type ClaudeCliJson = Record<string, any>;
 
 type ClaudeCliContentBlockState =
-	| { type: "text"; text: string }
+	| { type: "text"; text: string; suppressed?: boolean }
 	| { type: "thinking"; text: string }
 	| { type: "tool_use"; id?: string; name?: string; inputJson: string; announcedInput: boolean }
 	| { type: string; name?: string; text?: string; inputJson?: string; announcedInput?: boolean };
@@ -957,6 +957,7 @@ type ClaudePromptBridgeState = {
 	resultsToIgnore: number;
 	awaitingFollowupResult: boolean;
 	answersSent: number;
+	suppressIntermediateText: boolean;
 };
 
 function parseJsonLine(line: string): ClaudeCliJson | undefined {
@@ -1167,6 +1168,7 @@ function createWorkerRequestState(input: {
 		resultsToIgnore: 0,
 		awaitingFollowupResult: false,
 		answersSent: 0,
+		suppressIntermediateText: false,
 	};
 
 	const updateDisplay = (nextText: string, delta: string) => {
@@ -1195,11 +1197,20 @@ function createWorkerRequestState(input: {
 		updateDisplay(finalText, delta);
 	};
 
+	const canBridgeClaudeQuestion = (toolName: string | undefined) =>
+		toolName === "AskUserQuestion" && !!input.options?.onUserQuestion && !!input.sendUserInput;
+
+	const armClaudeQuestionBridge = () => {
+		promptBridge.resultsToIgnore = Math.max(promptBridge.resultsToIgnore, 1);
+		promptBridge.suppressIntermediateText = true;
+	};
+
 	const announceToolInput = (block: ClaudeCliContentBlockState) => {
 		if (block.type !== "tool_use" || block.announcedInput) return;
 		const toolInput = parseToolInputJson(block.inputJson);
 		const questionRequest = claudeUserQuestionRequest(block.name, toolInput);
-		if (questionRequest && input.options?.onUserQuestion && input.sendUserInput) {
+		if (questionRequest && canBridgeClaudeQuestion(block.name)) {
+			armClaudeQuestionBridge();
 			block.announcedInput = true;
 			void answerClaudeUserQuestion(questionRequest);
 			return;
@@ -1219,7 +1230,7 @@ function createWorkerRequestState(input: {
 
 	async function answerClaudeUserQuestion(request: UserQuestionRequest): Promise<void> {
 		promptBridge.pendingPrompts += 1;
-		promptBridge.resultsToIgnore = Math.max(promptBridge.resultsToIgnore, 1);
+		armClaudeQuestionBridge();
 		try {
 			const answer = await input.options?.onUserQuestion?.(request, input.model);
 			promptBridge.pendingPrompts = Math.max(0, promptBridge.pendingPrompts - 1);
@@ -1232,6 +1243,7 @@ function createWorkerRequestState(input: {
 			if (input.sendUserInput?.(response)) {
 				promptBridge.answersSent += 1;
 				promptBridge.awaitingFollowupResult = true;
+				promptBridge.suppressIntermediateText = false;
 			}
 		} catch {
 			promptBridge.pendingPrompts = Math.max(0, promptBridge.pendingPrompts - 1);
@@ -1242,6 +1254,7 @@ function createWorkerRequestState(input: {
 			if (input.sendUserInput?.(response)) {
 				promptBridge.answersSent += 1;
 				promptBridge.awaitingFollowupResult = true;
+				promptBridge.suppressIntermediateText = false;
 			}
 		}
 	}
@@ -1350,7 +1363,8 @@ function createWorkerRequestState(input: {
 				const block = streamEvent.content_block as ClaudeCliJson | undefined;
 				const blockType = typeof block?.type === "string" ? block.type : "unknown";
 				if (blockType === "text") {
-					blocks.set(index, { type: "text", text: "" });
+					blocks.set(index, { type: "text", text: "", suppressed: promptBridge.suppressIntermediateText });
+					if (promptBridge.suppressIntermediateText) return false;
 					const boundary = textBlockBoundary(finalText);
 					if (boundary) {
 						finalText += boundary;
@@ -1358,6 +1372,7 @@ function createWorkerRequestState(input: {
 					} else if (!finalText && displayText) updateDisplay("", "");
 				} else if (blockType === "tool_use") {
 					const toolName = typeof block?.name === "string" ? block.name : "tool";
+					if (canBridgeClaudeQuestion(toolName)) armClaudeQuestionBridge();
 					blocks.set(index, {
 						type: "tool_use",
 						id: typeof block?.id === "string" ? block.id : undefined,
@@ -1377,6 +1392,7 @@ function createWorkerRequestState(input: {
 				const delta = streamEvent.delta as ClaudeCliJson | undefined;
 				if (!block || !delta) return false;
 				if (block.type === "text" && delta.type === "text_delta" && typeof delta.text === "string") {
+					if ("suppressed" in block && block.suppressed) return false;
 					finalText += delta.text;
 					updateDisplay(finalText, delta.text);
 				}

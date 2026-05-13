@@ -191,16 +191,33 @@ function noCapturedQuestionAnswerResponse(): string {
 	].join("\n");
 }
 
-type QuestionSelection = number | Set<number>;
+type QuestionSelection = number | Set<number> | { optionIndex: number; text: string };
+
+function isFreeformQuestionOption(option: UserQuestion["options"][number]): boolean {
+	const label = option.label.toLowerCase();
+	return /\b(other|custom|specify|describe|explain|chat|type|write|something else)\b/.test(label);
+}
 
 function buildQuestionAnswerText(request: UserQuestionRequest, selections: QuestionSelection[]): string {
 	const answers = request.questions.map((question, index) => {
 		const selection = selections[index];
-		const selectedOptions =
-			selection instanceof Set
-				? [...selection].sort((a, b) => a - b).map((optionIndex) => question.options[optionIndex])
-				: [question.options[selection]];
-		const answer = selectedOptions.filter(Boolean).map(formatUserQuestionOption).join(", ") || "No option selected";
+		let answer: string;
+		if (selection instanceof Set) {
+			answer =
+				[...selection]
+					.sort((a, b) => a - b)
+					.map((optionIndex) => question.options[optionIndex])
+					.filter(Boolean)
+					.map(formatUserQuestionOption)
+					.join(", ") || "No option selected";
+		} else if (typeof selection === "number") {
+			const selectedOption = question.options[selection];
+			answer = selectedOption ? formatUserQuestionOption(selectedOption) : "No option selected";
+		} else {
+			const selectedOption = question.options[selection.optionIndex];
+			const optionText = selectedOption ? formatUserQuestionOption(selectedOption) : "Custom answer";
+			answer = `${optionText}: ${selection.text}`;
+		}
 		return [
 			`${index + 1}. ${question.header ? `${question.header}: ` : ""}${question.question}`,
 			`Answer: ${answer}`,
@@ -227,6 +244,13 @@ function createQuestionnaireComponent(
 	const selections: QuestionSelection[] = questions.map((question) => (question.multiSelect ? new Set<number>() : -1));
 	let activeQuestion = 0;
 	let activeOption = 0;
+	let textEntry:
+		| {
+				questionIndex: number;
+				optionIndex: number;
+				value: string;
+		  }
+		| undefined;
 
 	const clampActiveOption = () => {
 		const optionCount = questions[activeQuestion]?.options.length ?? 0;
@@ -236,6 +260,22 @@ function createQuestionnaireComponent(
 	const moveQuestion = (delta: number) => {
 		activeQuestion = Math.max(0, Math.min(questions.length - 1, activeQuestion + delta));
 		clampActiveOption();
+		tui.requestRender();
+	};
+
+	const moveOption = (delta: number) => {
+		const optionCount = questions[activeQuestion]?.options.length ?? 0;
+		const nextOption = activeOption + delta;
+		if (nextOption >= 0 && nextOption < optionCount) {
+			activeOption = nextOption;
+			tui.requestRender();
+			return;
+		}
+		const nextQuestion = activeQuestion + (delta < 0 ? -1 : 1);
+		if (nextQuestion < 0 || nextQuestion >= questions.length) return;
+		activeQuestion = nextQuestion;
+		const nextOptionCount = questions[activeQuestion]?.options.length ?? 0;
+		activeOption = delta < 0 ? Math.max(0, nextOptionCount - 1) : 0;
 		tui.requestRender();
 	};
 
@@ -253,6 +293,11 @@ function createQuestionnaireComponent(
 				else selection.add(activeOption);
 			}
 		} else {
+			if (advance && isFreeformQuestionOption(question.options[activeOption])) {
+				textEntry = { questionIndex: activeQuestion, optionIndex: activeOption, value: "" };
+				tui.requestRender();
+				return;
+			}
 			selections[activeQuestion] = activeOption;
 		}
 		if (advance) {
@@ -286,10 +331,18 @@ function createQuestionnaireComponent(
 					const option = question.options[optionIndex];
 					const isActiveOption = isActiveQuestion && optionIndex === activeOption;
 					const selection = selections[questionIndex];
-					const selected = selection instanceof Set ? selection.has(optionIndex) : selection === optionIndex;
+					const selected =
+						selection instanceof Set
+							? selection.has(optionIndex)
+							: typeof selection === "number"
+								? selection === optionIndex
+								: selection.optionIndex === optionIndex;
 					const marker = question.multiSelect ? (selected ? "[x]" : "[ ]") : selected ? "(*)" : "( )";
 					const optionLine = `  ${isActiveOption ? ">" : " "} ${marker} ${formatUserQuestionOption(option)}`;
 					addLine(isActiveOption ? uiTheme.fg("accent", optionLine) : optionLine);
+					if (textEntry && textEntry.questionIndex === questionIndex && textEntry.optionIndex === optionIndex) {
+						addLine(`      Answer: ${textEntry.value || "_"}`);
+					}
 				}
 				if (questionIndex < questions.length - 1) addLine();
 			}
@@ -297,18 +350,43 @@ function createQuestionnaireComponent(
 		},
 		handleInput(data: string): void {
 			const kb = getKeybindings();
+			if (textEntry) {
+				if (kb.matches(data, "tui.select.cancel")) {
+					textEntry = undefined;
+					tui.requestRender();
+					return;
+				}
+				if (kb.matches(data, "tui.editor.deleteCharBackward")) {
+					textEntry.value = textEntry.value.slice(0, -1);
+					tui.requestRender();
+					return;
+				}
+				if (kb.matches(data, "tui.select.confirm") || data === "\n") {
+					const value = textEntry.value.trim();
+					selections[textEntry.questionIndex] = value
+						? { optionIndex: textEntry.optionIndex, text: value }
+						: textEntry.optionIndex;
+					textEntry = undefined;
+					if (activeQuestion >= questions.length - 1) submit();
+					else moveQuestion(1);
+					return;
+				}
+				if (data.length === 1 && data >= " ") {
+					textEntry.value += data;
+					tui.requestRender();
+				}
+				return;
+			}
 			if (kb.matches(data, "tui.select.cancel")) {
 				done(undefined);
 				return;
 			}
 			if (kb.matches(data, "tui.select.up")) {
-				activeOption = Math.max(0, activeOption - 1);
-				tui.requestRender();
+				moveOption(-1);
 				return;
 			}
 			if (kb.matches(data, "tui.select.down")) {
-				activeOption = Math.min(questions[activeQuestion].options.length - 1, activeOption + 1);
-				tui.requestRender();
+				moveOption(1);
 				return;
 			}
 			if (kb.matches(data, "tui.editor.cursorLeft")) {
