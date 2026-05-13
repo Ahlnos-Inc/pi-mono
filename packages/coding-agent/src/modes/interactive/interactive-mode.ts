@@ -267,6 +267,7 @@ export class InteractiveMode {
 	private version: string;
 	private isInitialized = false;
 	private onInputCallback?: (input: SubmittedInput) => void;
+	private submittedUserEchoText: string | undefined = undefined;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private workingStartedAtMs: number | undefined = undefined;
@@ -781,6 +782,9 @@ export class InteractiveMode {
 		// Main interactive loop
 		while (true) {
 			const userInput = await this.getUserInput();
+			if (!this.isExtensionCommand(userInput.text)) {
+				this.showSubmittedUserEcho(userInput);
+			}
 			try {
 				await this.session.prompt(userInput.text, { images: userInput.images });
 			} catch (error: unknown) {
@@ -2786,7 +2790,9 @@ export class InteractiveMode {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
-					this.addMessageToChat(event.message);
+					if (!this.consumeSubmittedUserEcho(event.message)) {
+						this.addMessageToChat(event.message);
+					}
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
@@ -3195,6 +3201,27 @@ export class InteractiveMode {
 				const _exhaustive: never = message;
 			}
 		}
+	}
+
+	private showSubmittedUserEcho(input: SubmittedInput): void {
+		if (!input.text) return;
+		this.submittedUserEchoText = input.text;
+		this.addMessageToChat({
+			role: "user",
+			content: [{ type: "text", text: input.text }],
+			timestamp: Date.now(),
+		});
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
+	}
+
+	private consumeSubmittedUserEcho(message: AgentMessage): boolean {
+		if (message.role !== "user" || this.submittedUserEchoText === undefined) {
+			return false;
+		}
+		const echoedText = this.submittedUserEchoText;
+		this.submittedUserEchoText = undefined;
+		return this.getUserMessageText(message) === echoedText;
 	}
 
 	/**

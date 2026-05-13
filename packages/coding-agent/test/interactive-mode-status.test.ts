@@ -80,6 +80,39 @@ describe("InteractiveMode.showStatus", () => {
 	});
 });
 
+describe("InteractiveMode submitted user echo", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	test("renders submitted prompts immediately and suppresses the matching message_start duplicate", () => {
+		const prototype = InteractiveMode.prototype as any;
+		const fakeThis: any = {
+			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
+			submittedUserEchoText: undefined,
+			getMarkdownThemeWithSettings: () => undefined,
+			updatePendingMessagesDisplay: vi.fn(),
+			addMessageToChat: prototype.addMessageToChat,
+			getUserMessageText: prototype.getUserMessageText,
+		};
+
+		prototype.showSubmittedUserEcho.call(fakeThis, { text: "Commit and push." });
+
+		expect(renderAll(fakeThis.chatContainer)).toContain("Commit and push.");
+		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
+		expect(fakeThis.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+		expect(
+			prototype.consumeSubmittedUserEcho.call(fakeThis, {
+				role: "user",
+				content: [{ type: "text", text: "Commit and push." }],
+				timestamp: Date.now(),
+			}),
+		).toBe(true);
+		expect(fakeThis.submittedUserEchoText).toBeUndefined();
+	});
+});
+
 describe("InteractiveMode.setToolsExpanded", () => {
 	test("applies expansion state to the active header and chat entries", () => {
 		const header = { setExpanded: vi.fn() };
