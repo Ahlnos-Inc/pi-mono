@@ -1131,18 +1131,25 @@ function activityLine(text: string): string {
 function claudeSessionStatusVerb(session: StickyClaudeSession): string {
 	switch (session.reuseStatus) {
 		case "resume":
-			return "resuming previous session";
+			return "Resuming session";
 		case "resumed-across-agents":
-			return "resuming session across agent context";
+			return "Resuming across agents";
 		case "stale-recreated":
-			return "initializing replacement session";
+			return "Replacing stale session";
 		case "ephemeral":
-			return "initializing one-turn session";
+			return "One-turn session";
 		case "disabled":
-			return "initializing session";
+			return "Initializing session";
 		default:
-			return "initializing new session";
+			return "Initializing session";
 	}
+}
+
+function compactClaudeModelId(modelId: string): string {
+	const withoutPrefix = modelId.replace(/^claude-/, "");
+	const datedFamily = withoutPrefix.match(/^([a-z]+)-(\d+)-(\d+)(?:-\d{8})?$/);
+	if (datedFamily) return `${datedFamily[1]}-${datedFamily[2]}.${datedFamily[3]}`;
+	return withoutPrefix;
 }
 
 function claudeSessionStatusMessage(
@@ -1151,8 +1158,14 @@ function claudeSessionStatusMessage(
 	toolCount?: number | undefined,
 ): string {
 	const shortId = session.sessionId.slice(0, 8);
-	const tools = toolCount === undefined ? "" : ` · ${toolCount} tool${toolCount === 1 ? "" : "s"}`;
-	return `Claude CLI: ${claudeSessionStatusVerb(session)} ${shortId} · ${modelId}${tools}`;
+	const groups = [
+		"Claude CLI",
+		claudeSessionStatusVerb(session),
+		shortId,
+		compactClaudeModelId(modelId),
+		toolCount === undefined ? undefined : `${toolCount} tool${toolCount === 1 ? "" : "s"}`,
+	].filter((value): value is string => typeof value === "string" && value.length > 0);
+	return groups.join("  ");
 }
 
 function textBlockBoundary(text: string): string {

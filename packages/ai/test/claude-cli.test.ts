@@ -282,8 +282,10 @@ describe("claude-cli provider", () => {
 		firstChild.emit("close", 0);
 		const firstEvents = await firstEventsPromise;
 		const firstStatuses = firstEvents.filter((event) => event.type === "status");
-		expect(firstStatuses[0]?.message).toContain("initializing new session");
+		expect(firstStatuses[0]?.message).toMatch(/^Claude CLI {2}Initializing session {2}[0-9a-f]{8} {2}sonnet-4\.5$/);
 		expect(firstStatuses.at(-1)?.message).toContain("2 tools");
+		expect(firstStatuses.at(-1)?.message).not.toContain("Claude CLI:");
+		expect(firstStatuses.at(-1)?.message).not.toContain(" · ");
 
 		const secondEventsPromise = collectEvents(streamClaudeCli(model, context("same system"), {}));
 		writeJsonl(secondChild, [
@@ -293,7 +295,7 @@ describe("claude-cli provider", () => {
 		secondChild.emit("close", 0);
 		const secondEvents = await secondEventsPromise;
 		const secondStatuses = secondEvents.filter((event) => event.type === "status");
-		expect(secondStatuses[0]?.message).toContain("resuming previous session");
+		expect(secondStatuses[0]?.message).toContain("Resuming session");
 
 		const done = secondEvents.find((event) => event.type === "done");
 		expect(done?.type).toBe("done");
