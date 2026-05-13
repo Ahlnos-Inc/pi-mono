@@ -1114,10 +1114,13 @@ export class AgentSession {
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
 	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
-		// Parse command name and args
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+		// Parse command name and args. Use first whitespace, not only a literal
+		// space, so multiline commands like `/memory\n...` are real extension
+		// commands and do not render the whole body as a submitted user echo.
+		const commandMatch = text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+		if (!commandMatch) return false;
+		const commandName = commandMatch[1];
+		const args = commandMatch[2] ?? "";
 
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
@@ -1249,8 +1252,9 @@ export class AgentSession {
 	 * Throw an error if the text is an extension command.
 	 */
 	private _throwIfExtensionCommand(text: string): void {
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		const commandMatch = text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+		if (!commandMatch) return;
+		const commandName = commandMatch[1];
 		const command = this._extensionRunner.getCommand(commandName);
 
 		if (command) {

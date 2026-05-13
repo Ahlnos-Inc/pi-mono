@@ -3807,9 +3807,9 @@ export class InteractiveMode {
 		if (!text.startsWith("/")) return false;
 
 		const extensionRunner = this.session.extensionRunner;
-
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		const commandMatch = text.match(/^\/([^\s]+)(?:\s+[\s\S]*)?$/);
+		if (!commandMatch) return false;
+		const commandName = commandMatch[1];
 		return !!extensionRunner.getCommand(commandName);
 	}
 
