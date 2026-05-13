@@ -257,6 +257,40 @@ function emptyCustomModelsResult(error?: string): CustomModelsResult {
 	return { models: [], overrides: new Map(), modelOverrides: new Map(), error };
 }
 
+function localModelsJsonPath(modelsJsonPath: string): string {
+	return modelsJsonPath.endsWith(".json")
+		? modelsJsonPath.slice(0, -".json".length) + ".local.json"
+		: `${modelsJsonPath}.local`;
+}
+
+function mergeProviderOverrides(
+	base: Map<string, ProviderOverride>,
+	overlay: Map<string, ProviderOverride>,
+): Map<string, ProviderOverride> {
+	const merged = new Map(base);
+	for (const [provider, override] of overlay) {
+		const existing = merged.get(provider) ?? {};
+		merged.set(provider, { ...existing, ...override });
+	}
+	return merged;
+}
+
+function mergeModelOverrides(
+	base: Map<string, Map<string, ModelOverride>>,
+	overlay: Map<string, Map<string, ModelOverride>>,
+): Map<string, Map<string, ModelOverride>> {
+	const merged = new Map<string, Map<string, ModelOverride>>();
+	for (const [provider, models] of base) {
+		merged.set(provider, new Map(models));
+	}
+	for (const [provider, models] of overlay) {
+		const providerModels = merged.get(provider) ?? new Map<string, ModelOverride>();
+		for (const [model, override] of models) providerModels.set(model, override);
+		merged.set(provider, providerModels);
+	}
+	return merged;
+}
+
 function mergeCompat(
 	baseCompat: Model<Api>["compat"],
 	overrideCompat: ModelOverride["compat"],
@@ -377,12 +411,20 @@ export class ModelRegistry {
 
 	private loadModels(): void {
 		// Load custom models and overrides from models.json
-		const {
+		let {
 			models: customModels,
 			overrides,
 			modelOverrides,
 			error,
 		} = this.modelsJsonPath ? this.loadCustomModels(this.modelsJsonPath) : emptyCustomModelsResult();
+
+		if (this.modelsJsonPath) {
+			const local = this.loadCustomModels(localModelsJsonPath(this.modelsJsonPath));
+			customModels = this.mergeCustomModels(customModels, local.models);
+			overrides = mergeProviderOverrides(overrides, local.overrides);
+			modelOverrides = mergeModelOverrides(modelOverrides, local.modelOverrides);
+			if (local.error) error = error ? `${error}\n\n${local.error}` : local.error;
+		}
 
 		if (error) {
 			this.loadError = error;

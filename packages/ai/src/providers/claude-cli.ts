@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { registerSessionResourceCleanup } from "../session-resources.js";
@@ -34,8 +34,9 @@ import { createAssistantMessageEventStream } from "../utils/event-stream.js";
  * Streaming: claude is invoked with stream-json input and output. Pi writes the user prompt as
  * a JSONL envelope on stdin and reads JSONL records for model deltas, tool calls, tool results,
  * lifecycle status, and the final result. Pi still treats claude-cli as one provider call:
- * Claude's internal tool calls are surfaced as compact activity text only, never as Pi ToolCall
- * blocks, so Pi does not re-execute them.
+ * Claude's internal tool calls are not emitted as Pi ToolCall blocks, so Pi does not re-execute
+ * them. Low-level Claude activity is quiet by default; set PI_CLAUDE_CLI_ACTIVITY_TEXT=1 when
+ * debugging the raw subprocess lifecycle.
  *
  * System prompt is passed via `claude -p --system-prompt` when present so Pi's prompt
  * replaces Claude Code's default agent prompt instead of stacking on top of it.
@@ -180,6 +181,16 @@ function includeUserClaudeContext(): boolean {
 	return /^(1|true|yes|on)$/i.test(process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT ?? "");
 }
 
+function claudeBriefEnabled(): boolean {
+	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_BRIEF ?? "1");
+}
+
+function claudeActivityTextEnabled(): boolean {
+	return /^(1|true|yes|on)$/i.test(
+		process.env.PI_CLAUDE_CLI_ACTIVITY_TEXT ?? process.env.PI_CLAUDE_CLI_VERBOSE_ACTIVITY ?? "",
+	);
+}
+
 function stickyClaudeSessionsEnabled(): boolean {
 	return !/^(0|false|no|off)$/i.test(process.env.PI_CLAUDE_CLI_STICKY_SESSIONS ?? "1");
 }
@@ -253,6 +264,83 @@ function piRoot(): string {
 
 function claudeSessionRegistryPath(): string {
 	return process.env.PI_CLAUDE_CLI_SESSION_DB ?? join(piRoot(), "state", "claude-cli-sessions.sqlite");
+}
+
+function claudeAuthProfileStatePath(): string {
+	return join(piRoot(), "state", "claude-auth-active.json");
+}
+
+function claudeAuthEnvPath(): string {
+	return process.env.PI_API_KEYS_ENV ?? join(piRoot(), "state", "api-keys.env");
+}
+
+function tokenFingerprint(token: string): string {
+	return `sha256:${digestText(token)}`;
+}
+
+function readEnvFile(path: string): Record<string, string> {
+	if (!existsSync(path)) return {};
+	const out: Record<string, string> = {};
+	for (const rawLine of readFileSync(path, "utf8").split("\n")) {
+		const line = rawLine.trim();
+		if (!line || line.startsWith("#")) continue;
+		const idx = line.indexOf("=");
+		if (idx < 1) continue;
+		const key = line.slice(0, idx).trim();
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+		out[key] = unquoteEnvValue(line.slice(idx + 1).trim());
+	}
+	return out;
+}
+
+function unquoteEnvValue(value: string): string {
+	if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+		return value
+			.slice(1, -1)
+			.replace(/\\n/g, "\n")
+			.replace(/\\r/g, "\r")
+			.replace(/\\t/g, "\t")
+			.replace(/\\"/g, '"')
+			.replace(/\\\\/g, "\\");
+	}
+	if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+		return value.slice(1, -1);
+	}
+	return value;
+}
+
+function applyPiClaudeAuthProfile(childEnv: NodeJS.ProcessEnv): void {
+	const path = claudeAuthProfileStatePath();
+	if (!existsSync(path)) return;
+	let state: unknown;
+	try {
+		state = JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		return;
+	}
+	if (!state || typeof state !== "object") return;
+	const record = state as Record<string, unknown>;
+	if (record.mode !== "profile") return;
+	const profile = typeof record.profile === "string" ? record.profile : "";
+	const tokenEnvVar = typeof record.token_env_var === "string" ? record.token_env_var : "";
+	if (!/^[a-z][a-z0-9_-]*$/.test(profile) || !/^CLAUDE_CODE_OAUTH_TOKEN_[A-Z0-9_]+$/.test(tokenEnvVar)) {
+		throw new Error(`invalid active Claude auth profile state in ${path}`);
+	}
+	const envPath = claudeAuthEnvPath();
+	const token = readEnvFile(envPath)[tokenEnvVar];
+	if (!token) throw new Error(`active Claude auth profile '${profile}' is missing ${tokenEnvVar} in ${envPath}`);
+	childEnv.CLAUDE_CODE_OAUTH_TOKEN = token;
+	childEnv.PI_CLAUDE_AUTH_PROFILE = profile;
+	childEnv.PI_CLAUDE_AUTH_FINGERPRINT = tokenFingerprint(token);
+}
+
+function claudeChildEnv(): NodeJS.ProcessEnv {
+	const childEnv: NodeJS.ProcessEnv = { ...process.env };
+	delete childEnv.ANTHROPIC_API_KEY;
+	delete childEnv.ANTHROPIC_AUTH_TOKEN;
+	delete childEnv.ANTHROPIC_BASE_URL;
+	applyPiClaudeAuthProfile(childEnv);
+	return childEnv;
 }
 
 function sqlString(value: string): string {
@@ -815,6 +903,8 @@ function buildClaudeInvocation(
 		model.id,
 	];
 
+	if (claudeBriefEnabled()) args.push("--brief");
+
 	if (stickySession) {
 		args.push(stickySession.turns > 0 ? "--resume" : "--session-id", stickySession.sessionId);
 	}
@@ -914,6 +1004,69 @@ function summarizeToolInput(toolName: string | undefined, input: unknown): strin
 	return undefined;
 }
 
+function parseToolInputJson(inputJson: string | undefined): Record<string, unknown> | undefined {
+	if (!inputJson) return undefined;
+	try {
+		const parsed = JSON.parse(inputJson);
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function stringValue(record: Record<string, unknown>, keys: string[]): string | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string" && value.trim()) return value.trim();
+	}
+	return undefined;
+}
+
+function optionLabel(option: unknown): string | undefined {
+	if (typeof option === "string" && option.trim()) return option.trim();
+	if (!option || typeof option !== "object") return undefined;
+	const record = option as Record<string, unknown>;
+	const label = stringValue(record, ["label", "value", "text", "title", "name"]);
+	const description = stringValue(record, ["description", "hint"]);
+	return description && label ? `${label} - ${description}` : label;
+}
+
+function formatOptions(options: unknown): string[] {
+	if (!Array.isArray(options)) return [];
+	return options.map(optionLabel).filter((value): value is string => !!value);
+}
+
+function formatClaudeQuestion(record: Record<string, unknown>): string | undefined {
+	const prompt = stringValue(record, ["question", "prompt", "message", "text"]);
+	if (!prompt) return undefined;
+	const options = formatOptions(record.options ?? record.choices);
+	if (options.length === 0) return prompt;
+	return [prompt, "", ...options.map((option) => `- ${option}`)].join("\n");
+}
+
+function claudeUserFacingToolText(toolName: string | undefined, input: unknown): string | undefined {
+	if (!toolName || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
+	const record = input as Record<string, unknown>;
+	if (toolName === "SendUserMessage" || toolName === "Brief") {
+		return stringValue(record, ["message", "text", "content", "prompt"]);
+	}
+	if (toolName === "AskUserQuestion") {
+		const questions = record.questions;
+		if (Array.isArray(questions) && questions.length > 0) {
+			const formatted = questions
+				.map((question, index) => {
+					if (!question || typeof question !== "object" || Array.isArray(question)) return undefined;
+					const text = formatClaudeQuestion(question as Record<string, unknown>);
+					return text ? `${index + 1}. ${text}` : undefined;
+				})
+				.filter((value): value is string => !!value);
+			return formatted.length > 0 ? formatted.join("\n\n") : undefined;
+		}
+		return formatClaudeQuestion(record);
+	}
+	return undefined;
+}
+
 function activityLine(text: string): string {
 	return `[claude-cli] ${text}\n`;
 }
@@ -951,6 +1104,7 @@ function createWorkerRequestState(input: {
 	let maxRuntimeTimer: ReturnType<typeof setTimeout> | undefined;
 	const blocks = new Map<number, ClaudeCliContentBlockState>();
 	const partial: AssistantMessage = buildAssistantMessage(input.model, "", "stop");
+	const emitActivityText = claudeActivityTextEnabled();
 
 	const updateDisplay = (nextText: string, delta: string) => {
 		resetIdleTimer();
@@ -965,9 +1119,33 @@ function createWorkerRequestState(input: {
 	};
 
 	const appendActivity = (text: string) => {
+		if (!emitActivityText) return;
 		if (finalText) return;
 		const line = activityLine(text);
 		updateDisplay(displayText + line, line);
+	};
+
+	const appendUserFacingToolText = (text: string) => {
+		const boundary = textBlockBoundary(finalText);
+		const delta = `${boundary}${text}`;
+		finalText += delta;
+		updateDisplay(finalText, delta);
+	};
+
+	const announceToolInput = (block: ClaudeCliContentBlockState) => {
+		if (block.type !== "tool_use" || block.announcedInput) return;
+		const input = parseToolInputJson(block.inputJson);
+		const userFacingText = claudeUserFacingToolText(block.name, input);
+		if (userFacingText) {
+			appendUserFacingToolText(userFacingText);
+			block.announcedInput = true;
+			return;
+		}
+		if (input) {
+			const summary = summarizeToolInput(block.name, input);
+			appendActivity(summary ? `running ${block.name}: ${summary}` : `running ${block.name}`);
+			block.announcedInput = true;
+		}
 	};
 
 	function resetIdleTimer() {
@@ -1097,22 +1275,17 @@ function createWorkerRequestState(input: {
 					typeof delta.partial_json === "string"
 				) {
 					block.inputJson = `${block.inputJson ?? ""}${delta.partial_json}`;
-					if (!block.announcedInput) {
-						try {
-							const summary = summarizeToolInput(block.name, JSON.parse(block.inputJson));
-							appendActivity(summary ? `running ${block.name}: ${summary}` : `running ${block.name}`);
-							block.announcedInput = true;
-						} catch {
-							// Wait for complete JSON.
-						}
-					}
+					announceToolInput(block);
 				}
 				return false;
 			}
 			if (streamEvent.type === "content_block_stop") {
 				const index = numberValue(streamEvent.index);
 				const block = blocks.get(index);
-				if (block?.type === "tool_use" && !block.announcedInput) appendActivity(`running ${block.name ?? "tool"}`);
+				if (block?.type === "tool_use" && !block.announcedInput) {
+					announceToolInput(block);
+					if (!block.announcedInput) appendActivity(`running ${block.name ?? "tool"}`);
+				}
 				blocks.delete(index);
 				return false;
 			}
@@ -1202,10 +1375,7 @@ class ClaudeWorker {
 		this.launchSystemPromptHash = stickySession.systemPromptHash;
 		const invocation = buildClaudeInvocation(model, context, "", stickySession);
 		this.tempFiles = invocation.tempFiles;
-		const childEnv: NodeJS.ProcessEnv = { ...process.env };
-		delete childEnv.ANTHROPIC_API_KEY;
-		delete childEnv.ANTHROPIC_AUTH_TOKEN;
-		delete childEnv.ANTHROPIC_BASE_URL;
+		const childEnv = claudeChildEnv();
 		const home = process.env.HOME ?? "/root";
 		this.child = spawn("claude", invocation.args, {
 			env: childEnv,
@@ -1432,17 +1602,13 @@ function runClaudeCliOneShot(
 	const idleTimeoutMs = resolveIdleTimeoutMs(options?.timeoutMs);
 	const maxRuntimeMs = resolveMaxRuntimeMs();
 
-	const childEnv: NodeJS.ProcessEnv = { ...process.env };
-	delete childEnv.ANTHROPIC_API_KEY;
-	delete childEnv.ANTHROPIC_AUTH_TOKEN;
-	delete childEnv.ANTHROPIC_BASE_URL;
-
 	const home = process.env.HOME ?? "/root";
 	const invocation = buildClaudeInvocation(model, context, prompt, stickySession);
 	if (stickySession)
 		appendClaudeSessionTelemetry(stickySession, stickySession.turns === 0 ? "start-new" : "resume-one-shot");
 	let child: ReturnType<typeof spawn>;
 	try {
+		const childEnv = claudeChildEnv();
 		child = spawn("claude", invocation.args, {
 			env: childEnv,
 			cwd: `${home}/projects/ahlnos`,
@@ -1473,6 +1639,7 @@ function runClaudeCliOneShot(
 	let maxRuntimeTimer: ReturnType<typeof setTimeout> | undefined;
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
 	const blocks = new Map<number, ClaudeCliContentBlockState>();
+	const emitActivityText = claudeActivityTextEnabled();
 
 	const onAbort = () => {
 		aborted = true;
@@ -1552,9 +1719,33 @@ function runClaudeCliOneShot(
 	};
 
 	const appendActivity = (text: string) => {
+		if (!emitActivityText) return;
 		if (finalText) return;
 		const line = activityLine(text);
 		updateDisplay(displayText + line, line);
+	};
+
+	const appendUserFacingToolText = (text: string) => {
+		const boundary = textBlockBoundary(finalText);
+		const delta = `${boundary}${text}`;
+		finalText += delta;
+		updateDisplay(finalText, delta);
+	};
+
+	const announceToolInput = (block: ClaudeCliContentBlockState) => {
+		if (block.type !== "tool_use" || block.announcedInput) return;
+		const input = parseToolInputJson(block.inputJson);
+		const userFacingText = claudeUserFacingToolText(block.name, input);
+		if (userFacingText) {
+			appendUserFacingToolText(userFacingText);
+			block.announcedInput = true;
+			return;
+		}
+		if (input) {
+			const summary = summarizeToolInput(block.name, input);
+			appendActivity(summary ? `running ${block.name}: ${summary}` : `running ${block.name}`);
+			block.announcedInput = true;
+		}
 	};
 
 	const handleClaudeEvent = (event: ClaudeCliJson) => {
@@ -1628,16 +1819,7 @@ function runClaudeCliOneShot(
 					typeof delta.partial_json === "string"
 				) {
 					block.inputJson = `${block.inputJson ?? ""}${delta.partial_json}`;
-					if (!block.announcedInput) {
-						try {
-							const input = JSON.parse(block.inputJson);
-							const summary = summarizeToolInput(block.name, input);
-							appendActivity(summary ? `running ${block.name}: ${summary}` : `running ${block.name}`);
-							block.announcedInput = true;
-						} catch {
-							// Wait until the streamed JSON object is complete enough to summarize.
-						}
-					}
+					announceToolInput(block);
 				}
 				return;
 			}
@@ -1645,7 +1827,10 @@ function runClaudeCliOneShot(
 			if (streamEvent.type === "content_block_stop") {
 				const index = numberValue(streamEvent.index);
 				const block = blocks.get(index);
-				if (block?.type === "tool_use" && !block.announcedInput) appendActivity(`running ${block.name ?? "tool"}`);
+				if (block?.type === "tool_use" && !block.announcedInput) {
+					announceToolInput(block);
+					if (!block.announcedInput) appendActivity(`running ${block.name ?? "tool"}`);
+				}
 				blocks.delete(index);
 				return;
 			}

@@ -9,6 +9,7 @@ Add custom providers and models (Ollama, vLLM, LM Studio, proxies) via `~/.pi/ag
 - [Supported APIs](#supported-apis)
 - [Provider Configuration](#provider-configuration)
 - [Model Configuration](#model-configuration)
+- [Local Machine Overlay](#local-machine-overlay)
 - [Overriding Built-in Providers](#overriding-built-in-providers)
 - [Per-model Overrides](#per-model-overrides)
 - [Anthropic Messages Compatibility](#anthropic-messages-compatibility)
@@ -90,6 +91,33 @@ Override defaults when you need specific values:
 ```
 
 The file reloads each time you open `/model`. Edit during session; no restart needed.
+
+## Local Machine Overlay
+
+Pi also loads `~/.pi/agent/models.local.json` when it exists. It uses the same
+schema as `models.json`, merges over the tracked file by `provider + id`, and is
+intended for machine-local model inventory such as Ollama models installed only
+on one workstation.
+
+Keep shared defaults in `models.json`; put host-specific local models, provider
+base URLs, or per-model overrides in `models.local.json`. For example:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "models": [
+        { "id": "qwen3-coder:30b", "contextWindow": 262144, "maxTokens": 8192 }
+      ]
+    }
+  }
+}
+```
+
+If both files define the same provider/model id, `models.local.json` wins.
 
 ## Google AI Studio Example
 

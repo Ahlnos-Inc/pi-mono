@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { _clearClaudeCliStickySessionsForTest, streamClaudeCli } from "../src/providers/claude-cli.js";
@@ -85,8 +87,19 @@ describe("claude-cli provider", () => {
 	beforeEach(() => {
 		vi.useRealTimers();
 		delete process.env.PI_CLAUDE_CLI_INCLUDE_USER_CONTEXT;
+		delete process.env.PI_CLAUDE_CLI_BRIEF;
+		delete process.env.PI_CLAUDE_CLI_ACTIVITY_TEXT;
+		delete process.env.PI_CLAUDE_CLI_VERBOSE_ACTIVITY;
 		delete process.env.PI_CLAUDE_CLI_STICKY_SESSIONS;
 		delete process.env.TMUX_PANE;
+		delete process.env.PI_ROOT;
+		delete process.env.PI_API_KEYS_ENV;
+		delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+		delete process.env.PI_CLAUDE_AUTH_PROFILE;
+		delete process.env.PI_CLAUDE_AUTH_FINGERPRINT;
+		delete process.env.ANTHROPIC_API_KEY;
+		delete process.env.ANTHROPIC_AUTH_TOKEN;
+		delete process.env.ANTHROPIC_BASE_URL;
 		process.env.PI_CLAUDE_CLI_WORKERS = "0";
 		process.env.PI_CLAUDE_CLI_SESSION_REGISTRY = "0";
 		process.env.PI_CLAUDE_CLI_SESSION_TELEMETRY = "0";
@@ -111,6 +124,7 @@ describe("claude-cli provider", () => {
 				"--output-format",
 				"stream-json",
 				"--include-partial-messages",
+				"--brief",
 				"--model",
 				model.id,
 				"--setting-sources",
@@ -135,6 +149,40 @@ describe("claude-cli provider", () => {
 			`${JSON.stringify({ type: "user", message: { role: "user", content: "hello" } })}\n`,
 		);
 		expect(spawnMock.mock.calls[0][2]).not.toHaveProperty("shell");
+	});
+
+	it("scrubs Anthropic API env and applies the active Pi Claude auth profile", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-claude-auth-provider-"));
+		try {
+			mkdirSync(join(root, "state"), { recursive: true });
+			writeFileSync(join(root, "state", "api-keys.env"), 'CLAUDE_CODE_OAUTH_TOKEN_NICHOLAS="profile-token"\n');
+			writeFileSync(
+				join(root, "state", "claude-auth-active.json"),
+				JSON.stringify({
+					version: 1,
+					mode: "profile",
+					profile: "nicholas",
+					token_env_var: "CLAUDE_CODE_OAUTH_TOKEN_NICHOLAS",
+					token_fingerprint: "sha256:old",
+				}),
+			);
+			process.env.PI_ROOT = root;
+			process.env.ANTHROPIC_API_KEY = "payg-key";
+			process.env.ANTHROPIC_AUTH_TOKEN = "wrong-token";
+			process.env.ANTHROPIC_BASE_URL = "https://example.invalid";
+
+			streamClaudeCli(model, context(), {});
+
+			const childEnv = spawnMock.mock.calls[0][2].env as NodeJS.ProcessEnv;
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_AUTH_TOKEN");
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_BASE_URL");
+			expect(childEnv.CLAUDE_CODE_OAUTH_TOKEN).toBe("profile-token");
+			expect(childEnv.PI_CLAUDE_AUTH_PROFILE).toBe("nicholas");
+			expect(childEnv.PI_CLAUDE_AUTH_FINGERPRINT).toMatch(/^sha256:/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("can restore the full user Claude Code environment explicitly", () => {
@@ -654,7 +702,7 @@ describe("claude-cli provider", () => {
 		expect(secondSession).not.toBe(firstSession);
 	});
 
-	it("reports silent claude subprocess idle intervals without terminating it", async () => {
+	it("keeps silent claude subprocess idle intervals out of the transcript by default", async () => {
 		vi.useFakeTimers();
 		const child = new MockChildProcess();
 		spawnMock.mockReturnValue(child);
@@ -665,6 +713,24 @@ describe("claude-cli provider", () => {
 		vi.advanceTimersByTime(25);
 
 		expect(child.kill).not.toHaveBeenCalled();
+		child.emit("close", 0);
+
+		const events = await eventsPromise;
+		expect(events.some((event) => event.type === "text_delta" && event.delta.includes("no claude-cli output"))).toBe(
+			false,
+		);
+	});
+
+	it("can opt into claude-cli activity text for debugging", async () => {
+		vi.useFakeTimers();
+		process.env.PI_CLAUDE_CLI_ACTIVITY_TEXT = "1";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		const stream = streamClaudeCli(model, context(), { timeoutMs: 25 });
+		const eventsPromise = collectEvents(stream);
+
+		vi.advanceTimersByTime(25);
 		child.emit("close", 0);
 
 		const events = await eventsPromise;
@@ -798,7 +864,7 @@ describe("claude-cli provider", () => {
 		});
 	});
 
-	it("surfaces claude-cli tool activity without emitting Pi tool calls", async () => {
+	it("keeps claude-cli tool activity out of assistant text by default without emitting Pi tool calls", async () => {
 		const child = new MockChildProcess();
 		spawnMock.mockReturnValue(child);
 
@@ -840,13 +906,86 @@ describe("claude-cli provider", () => {
 		const events = await eventsPromise;
 		const textDeltas = events.filter((event) => event.type === "text_delta");
 		expect(textDeltas.some((event) => event.type === "text_delta" && event.delta.includes("running Bash: pwd"))).toBe(
-			true,
+			false,
 		);
 		expect(events.some((event) => event.type === "toolcall_start" || event.type === "toolcall_end")).toBe(false);
 
 		const done = events.find((event) => event.type === "done");
 		if (done?.type !== "done") throw new Error("Expected done event");
 		expect(done.message.content).toEqual([{ type: "text", text: "/tmp" }]);
+	});
+
+	it("surfaces claude-cli tool activity when activity text is enabled", async () => {
+		process.env.PI_CLAUDE_CLI_ACTIVITY_TEXT = "1";
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		const stream = streamClaudeCli(model, context(), {});
+		const eventsPromise = collectEvents(stream);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "toolu_1", name: "Bash" },
+				},
+			},
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "input_json_delta", partial_json: '{"command":"pwd"}' },
+				},
+			},
+			{ type: "result", subtype: "success", result: "/tmp", usage: { input_tokens: 1, output_tokens: 1 } },
+		]);
+		child.emit("close", 0);
+
+		const events = await eventsPromise;
+		expect(events.some((event) => event.type === "text_delta" && event.delta.includes("running Bash: pwd"))).toBe(
+			true,
+		);
+	});
+
+	it("surfaces Claude user-facing prompt tools as assistant text", async () => {
+		const child = new MockChildProcess();
+		spawnMock.mockReturnValue(child);
+
+		const stream = streamClaudeCli(model, context(), {});
+		const eventsPromise = collectEvents(stream);
+
+		writeJsonl(child, [
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "toolu_1", name: "AskUserQuestion" },
+				},
+			},
+			{
+				type: "stream_event",
+				event: {
+					type: "content_block_delta",
+					index: 0,
+					delta: {
+						type: "input_json_delta",
+						partial_json:
+							'{"question":"Which path should I take?","options":[{"label":"A","description":"Fast"},{"label":"B"}]}',
+					},
+				},
+			},
+			{ type: "result", subtype: "success", result: "", usage: { input_tokens: 1, output_tokens: 1 } },
+		]);
+		child.emit("close", 0);
+
+		const events = await eventsPromise;
+		const done = events.find((event) => event.type === "done");
+		if (done?.type !== "done") throw new Error("Expected done event");
+		expect(done.message.content).toEqual([{ type: "text", text: "Which path should I take?\n\n- A - Fast\n- B" }]);
 	});
 
 	it("preserves paragraph breaks between text blocks separated by Claude tool use", async () => {
