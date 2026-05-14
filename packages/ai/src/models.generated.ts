@@ -1014,7 +1014,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 128000,
-			maxTokens: 4096,
+			maxTokens: 16384,
 		} satisfies Model<"bedrock-converse-stream">,
 		"openai.gpt-oss-20b-1:0": {
 			id: "openai.gpt-oss-20b-1:0",
@@ -1031,7 +1031,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 128000,
-			maxTokens: 4096,
+			maxTokens: 16384,
 		} satisfies Model<"bedrock-converse-stream">,
 		"openai.gpt-oss-safeguard-120b": {
 			id: "openai.gpt-oss-safeguard-120b",
@@ -1048,7 +1048,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 128000,
-			maxTokens: 4096,
+			maxTokens: 16384,
 		} satisfies Model<"bedrock-converse-stream">,
 		"openai.gpt-oss-safeguard-20b": {
 			id: "openai.gpt-oss-safeguard-20b",
@@ -1065,7 +1065,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 128000,
-			maxTokens: 4096,
+			maxTokens: 16384,
 		} satisfies Model<"bedrock-converse-stream">,
 		"qwen.qwen3-235b-a22b-2507-v1:0": {
 			id: "qwen.qwen3-235b-a22b-2507-v1:0",
@@ -8968,6 +8968,25 @@ export const MODELS = {
 			},
 			contextWindow: 1048576,
 			maxTokens: 131072,
+		} satisfies Model<"openai-completions">,
+		"deepseek/deepseek-v4-flash:free": {
+			id: "deepseek/deepseek-v4-flash:free",
+			name: "DeepSeek: DeepSeek V4 Flash (free)",
+			api: "openai-completions",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			compat: {"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"},
+			reasoning: true,
+			thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","xhigh":"max"},
+			input: ["text"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 256000,
+			maxTokens: 256000,
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v4-pro": {
 			id: "deepseek/deepseek-v4-pro",
