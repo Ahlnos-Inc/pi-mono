@@ -80,7 +80,7 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.js";
+import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionManager } from "./session-manager.js";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
 import type { SlashCommandInfo } from "./slash-commands.js";
@@ -1412,6 +1412,63 @@ export class AgentSession {
 		});
 	}
 
+	private _normalizeThinkingLevel(level: string): ThinkingLevel {
+		return THINKING_LEVELS.includes(level as ThinkingLevel) ? (level as ThinkingLevel) : DEFAULT_THINKING_LEVEL;
+	}
+
+	private async _restoreModelFromSessionContext(sessionContext: SessionContext): Promise<void> {
+		if (!sessionContext.model) {
+			return;
+		}
+
+		const restoredModel = this._modelRegistry.find(sessionContext.model.provider, sessionContext.model.modelId);
+		if (!restoredModel) {
+			return;
+		}
+
+		const previousModel = this.model;
+		this.agent.state.model = restoredModel;
+		await this._emitModelSelect(restoredModel, previousModel, "restore");
+	}
+
+	private _restoreThinkingLevelFromSessionContext(sessionContext: SessionContext, useSessionLevel: boolean): void {
+		const previousLevel = this.agent.state.thinkingLevel;
+		const requestedLevel = useSessionLevel
+			? this._normalizeThinkingLevel(sessionContext.thinkingLevel)
+			: previousLevel;
+		const effectiveLevel = this.model ? (clampThinkingLevel(this.model, requestedLevel) as ThinkingLevel) : "off";
+
+		this.agent.state.thinkingLevel = effectiveLevel;
+
+		if (effectiveLevel === previousLevel) {
+			return;
+		}
+
+		this._emit({ type: "thinking_level_changed", level: effectiveLevel });
+		void this._extensionRunner.emit({
+			type: "thinking_level_select",
+			level: effectiveLevel,
+			previousLevel,
+		});
+	}
+
+	private async _applySessionContext(sessionContext: SessionContext, useSessionThinkingLevel: boolean): Promise<void> {
+		this.agent.state.messages = sessionContext.messages;
+		await this._restoreModelFromSessionContext(sessionContext);
+		this._restoreThinkingLevelFromSessionContext(sessionContext, useSessionThinkingLevel);
+	}
+
+	/**
+	 * Restore live agent state from the current session branch without appending
+	 * model/thinking entries or changing persisted defaults.
+	 */
+	async restoreStateFromSessionBranch(): Promise<void> {
+		const branchHasThinkingLevel = this.sessionManager
+			.getBranch()
+			.some((entry) => entry.type === "thinking_level_change");
+		await this._applySessionContext(this.sessionManager.buildSessionContext(), branchHasThinkingLevel);
+	}
+
 	/**
 	 * Set model directly.
 	 * Validates that auth is configured, saves to session and settings.
@@ -1693,8 +1750,7 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
-			this.agent.state.messages = sessionContext.messages;
+			await this.restoreStateFromSessionBranch();
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -1965,8 +2021,7 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
-			this.agent.state.messages = sessionContext.messages;
+			await this.restoreStateFromSessionBranch();
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -2858,8 +2913,7 @@ export class AgentSession {
 			}
 
 			// Update agent state
-			const sessionContext = this.sessionManager.buildSessionContext();
-			this.agent.state.messages = sessionContext.messages;
+			await this.restoreStateFromSessionBranch();
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({
