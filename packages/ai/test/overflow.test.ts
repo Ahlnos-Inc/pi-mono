@@ -35,6 +35,20 @@ describe("isContextOverflow", () => {
 		expect(isContextOverflow(message, 32768)).toBe(true);
 	});
 
+	it("detects Together AI context length errors", () => {
+		const message = createErrorMessage(
+			"400 The input (516368 tokens) is longer than the model's context length (262144 tokens).",
+		);
+		expect(isContextOverflow(message, 262144)).toBe(true);
+	});
+
+	it("detects LiteLLM-wrapped OpenAI maximum context length errors", () => {
+		const message = createErrorMessage(
+			"Error: 503 litellm.ServiceUnavailableError: litellm.MidStreamFallbackError: litellm.APIConnectionError: APIConnectionError: OpenAIException - Requested token count exceeds the model's maximum context length of 131072 tokens.",
+		);
+		expect(isContextOverflow(message, 131072)).toBe(true);
+	});
+
 	it("does not treat generic non-overflow Ollama errors as overflow", () => {
 		const message = createErrorMessage("500 `model runner crashed unexpectedly`");
 		expect(isContextOverflow(message, 32768)).toBe(false);

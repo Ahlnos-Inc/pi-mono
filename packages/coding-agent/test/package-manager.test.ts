@@ -274,6 +274,94 @@ Content`,
 		});
 	});
 
+	describe("auto-discovered skill metadata", () => {
+		it("should use the agent dir as baseDir for user .pi/agent skills", async () => {
+			const skillPath = join(agentDir, "skills", "user-pi", "SKILL.md");
+			mkdirSync(join(agentDir, "skills", "user-pi"), { recursive: true });
+			writeFileSync(skillPath, "---\nname: user-pi\ndescription: user pi\n---\n");
+
+			const result = await packageManager.resolve();
+			const skill = result.skills.find((r) => r.path === skillPath);
+
+			expect(skill?.metadata.source).toBe("auto");
+			expect(skill?.metadata.scope).toBe("user");
+			expect(skill?.metadata.baseDir).toBe(agentDir);
+		});
+
+		it("should use the project .pi dir as baseDir for project .pi skills", async () => {
+			const projectBaseDir = join(tempDir, ".pi");
+			const skillPath = join(projectBaseDir, "skills", "project-pi", "SKILL.md");
+			mkdirSync(join(projectBaseDir, "skills", "project-pi"), { recursive: true });
+			writeFileSync(skillPath, "---\nname: project-pi\ndescription: project pi\n---\n");
+
+			const result = await packageManager.resolve();
+			const skill = result.skills.find((r) => r.path === skillPath);
+
+			expect(skill?.metadata.source).toBe("auto");
+			expect(skill?.metadata.scope).toBe("project");
+			expect(skill?.metadata.baseDir).toBe(projectBaseDir);
+		});
+
+		it("should use ~/.agents as baseDir for user .agents skills", async () => {
+			const previousHome = process.env.HOME;
+			process.env.HOME = tempDir;
+
+			try {
+				const agentsBaseDir = join(tempDir, ".agents");
+				const skillPath = join(agentsBaseDir, "skills", "user-agents", "SKILL.md");
+				mkdirSync(join(agentsBaseDir, "skills", "user-agents"), { recursive: true });
+				writeFileSync(skillPath, "---\nname: user-agents\ndescription: user agents\n---\n");
+
+				const result = await packageManager.resolve();
+				const skill = result.skills.find((r) => r.path === skillPath);
+
+				expect(skill?.metadata.source).toBe("auto");
+				expect(skill?.metadata.scope).toBe("user");
+				expect(skill?.metadata.baseDir).toBe(agentsBaseDir);
+			} finally {
+				if (previousHome === undefined) {
+					delete process.env.HOME;
+				} else {
+					process.env.HOME = previousHome;
+				}
+			}
+		});
+
+		it("should use each project .agents dir as baseDir for project .agents skills", async () => {
+			const repoRoot = join(tempDir, "repo");
+			const nestedCwd = join(repoRoot, "packages", "feature");
+			mkdirSync(nestedCwd, { recursive: true });
+			mkdirSync(join(repoRoot, ".git"), { recursive: true });
+
+			const repoAgentsBaseDir = join(repoRoot, ".agents");
+			const repoSkill = join(repoAgentsBaseDir, "skills", "repo", "SKILL.md");
+			mkdirSync(join(repoAgentsBaseDir, "skills", "repo"), { recursive: true });
+			writeFileSync(repoSkill, "---\nname: repo\ndescription: repo\n---\n");
+
+			const packageAgentsBaseDir = join(repoRoot, "packages", ".agents");
+			const packageSkill = join(packageAgentsBaseDir, "skills", "package", "SKILL.md");
+			mkdirSync(join(packageAgentsBaseDir, "skills", "package"), { recursive: true });
+			writeFileSync(packageSkill, "---\nname: package\ndescription: package\n---\n");
+
+			const pm = new DefaultPackageManager({
+				cwd: nestedCwd,
+				agentDir,
+				settingsManager,
+			});
+
+			const result = await pm.resolve();
+			const resolvedRepoSkill = result.skills.find((r) => r.path === repoSkill);
+			const resolvedPackageSkill = result.skills.find((r) => r.path === packageSkill);
+
+			expect(resolvedRepoSkill?.metadata.source).toBe("auto");
+			expect(resolvedRepoSkill?.metadata.scope).toBe("project");
+			expect(resolvedRepoSkill?.metadata.baseDir).toBe(repoAgentsBaseDir);
+			expect(resolvedPackageSkill?.metadata.source).toBe("auto");
+			expect(resolvedPackageSkill?.metadata.scope).toBe("project");
+			expect(resolvedPackageSkill?.metadata.baseDir).toBe(packageAgentsBaseDir);
+		});
+	});
+
 	describe(".agents/skills auto-discovery", () => {
 		it("should scan .agents/skills from cwd up to git repo root", async () => {
 			const repoRoot = join(tempDir, "repo");
@@ -709,6 +797,105 @@ Content`,
 
 			expect(packageManager.getInstalledPath("npm:@scope/pkg", "user")).toBeUndefined();
 			expect(runCommandSyncSpy).toHaveBeenNthCalledWith(2, "mise", ["exec", "node@22", "--", "npm", "root", "-g"]);
+		});
+
+		it("should resolve pnpm global package paths from pnpm list output", async () => {
+			settingsManager = SettingsManager.inMemory({
+				npmCommand: ["pnpm"],
+				packages: ["npm:pnpm-pkg"],
+			});
+			packageManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+			});
+
+			const pnpmRoot = join(tempDir, "pnpm", "global", "v11");
+			const packagePath = join(pnpmRoot, "20-hash", "node_modules", "pnpm-pkg");
+			let installed = false;
+
+			vi.spyOn(packageManager as any, "runCommandSync").mockImplementation((...callArgs: unknown[]) => {
+				const [command, args] = callArgs as [string, string[]];
+				if (command !== "pnpm") {
+					throw new Error(`unexpected command ${command}`);
+				}
+				if (args.join(" ") === "list -g --depth 0 --json") {
+					return JSON.stringify([
+						{
+							path: pnpmRoot,
+							dependencies: installed ? { "pnpm-pkg": { version: "1.0.0", path: packagePath } } : {},
+						},
+					]);
+				}
+				if (args.join(" ") === "root -g") {
+					return pnpmRoot;
+				}
+				throw new Error(`unexpected args ${args.join(" ")}`);
+			});
+			const runCommandSpy = vi
+				.spyOn(packageManager as any, "runCommand")
+				.mockImplementation(async (...callArgs: unknown[]) => {
+					const [command, args] = callArgs as [string, string[]];
+					expect(command).toBe("pnpm");
+					expect(args).toEqual(["install", "-g", "pnpm-pkg"]);
+					mkdirSync(join(packagePath, "extensions"), { recursive: true });
+					writeFileSync(join(packagePath, "package.json"), JSON.stringify({ name: "pnpm-pkg", version: "1.0.0" }));
+					writeFileSync(join(packagePath, "extensions", "index.ts"), "export default function() {};");
+					installed = true;
+				});
+
+			const first = await packageManager.resolve();
+			const second = await packageManager.resolve();
+
+			expect(first.extensions.some((r) => r.path === join(packagePath, "extensions", "index.ts") && r.enabled)).toBe(
+				true,
+			);
+			expect(
+				second.extensions.some((r) => r.path === join(packagePath, "extensions", "index.ts") && r.enabled),
+			).toBe(true);
+			expect(runCommandSpy).toHaveBeenCalledTimes(1);
+			expect(packageManager.getInstalledPath("npm:pnpm-pkg", "user")).toBe(packagePath);
+		});
+
+		it("should resolve wrapped pnpm global package paths from pnpm list output", () => {
+			settingsManager = SettingsManager.inMemory({
+				npmCommand: ["mise", "exec", "node@20", "--", "pnpm"],
+			});
+			packageManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+			});
+
+			const pnpmRoot = join(tempDir, "pnpm", "global", "v11");
+			const packagePath = join(pnpmRoot, "20-hash", "node_modules", "pnpm-pkg");
+			mkdirSync(packagePath, { recursive: true });
+
+			vi.spyOn(packageManager as any, "runCommandSync").mockImplementation((...callArgs: unknown[]) => {
+				const [command, args] = callArgs as [string, string[]];
+				expect(command).toBe("mise");
+				if (args.join(" ") === "exec node@20 -- pnpm list -g --depth 0 --json") {
+					return JSON.stringify([{ path: pnpmRoot, dependencies: { "pnpm-pkg": { path: packagePath } } }]);
+				}
+				throw new Error(`unexpected args ${args.join(" ")}`);
+			});
+
+			expect(packageManager.getInstalledPath("npm:pnpm-pkg", "user")).toBe(packagePath);
+		});
+
+		it("should fail when pnpm global package list is malformed", () => {
+			settingsManager = SettingsManager.inMemory({
+				npmCommand: ["pnpm"],
+			});
+			packageManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+			});
+
+			vi.spyOn(packageManager as any, "runCommandSync").mockReturnValue("not json");
+
+			expect(() => packageManager.getInstalledPath("npm:pnpm-pkg", "user")).toThrow();
 		});
 	});
 
