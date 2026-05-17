@@ -373,7 +373,7 @@ describe("StdinBuffer", () => {
 		let emittedPaste: string[] = [];
 
 		beforeEach(() => {
-			buffer = new StdinBuffer({ timeout: 10 });
+			buffer = new StdinBuffer({ timeout: 10, pasteTimeout: 20 });
 
 			// Collect emitted sequences
 			emittedSequences = [];
@@ -432,6 +432,28 @@ describe("StdinBuffer", () => {
 
 			assert.deepStrictEqual(emittedPaste, ["Hello 世界 🎉"]);
 			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("should recover from missing bracketed paste end marker", async () => {
+			processInput("\x1b[200~unterminated");
+			assert.deepStrictEqual(emittedPaste, []);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			await wait(25);
+
+			assert.deepStrictEqual(emittedPaste, ["unterminated"]);
+			processInput("ok");
+			assert.deepStrictEqual(emittedSequences, ["o", "k"]);
+		});
+
+		it("should reset the paste timeout when paste content continues arriving", async () => {
+			processInput("\x1b[200~hello");
+			await wait(10);
+			processInput(" world\x1b[201~");
+
+			assert.deepStrictEqual(emittedPaste, ["hello world"]);
+			await wait(25);
+			assert.deepStrictEqual(emittedPaste, ["hello world"]);
 		});
 	});
 

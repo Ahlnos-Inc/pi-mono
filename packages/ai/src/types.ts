@@ -108,6 +108,14 @@ export interface StreamOptions {
 	signal?: AbortSignal;
 	apiKey?: string;
 	/**
+	 * Claude CLI compaction policy. Ignored by providers that do not support the
+	 * local Claude CLI `--compaction-control` flag.
+	 */
+	compactionControl?: {
+		minInputTokens: number;
+		type: "summarize_sections";
+	};
+	/**
 	 * Preferred transport for providers that support multiple transports.
 	 * Providers that do not support this option ignore it.
 	 */

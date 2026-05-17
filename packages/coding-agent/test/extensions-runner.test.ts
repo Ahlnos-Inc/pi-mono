@@ -563,9 +563,35 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("before_agent_start", () => {
+		it("returns compaction control from before_agent_start handlers", async () => {
+			const extCode = `
+					export default function(pi) {
+						pi.on("before_agent_start", async () => ({
+							compactionControl: { minInputTokens: 1000, type: "summarize_sections" },
+						}));
+					}
+				`;
+			fs.writeFileSync(path.join(extensionsDir, "before-agent-start-compaction.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			expect(result.errors).toEqual([]);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			const beforeStart = await runner.emitBeforeAgentStart("hello", undefined, "base", {
+				cwd: tempDir,
+			});
+
+			expect(beforeStart).toEqual({
+				messages: undefined,
+				systemPrompt: undefined,
+				compactionControl: { minInputTokens: 1000, type: "summarize_sections" },
+			});
+		});
+
 		it("keeps ctx.getSystemPrompt() in sync with chained system prompt updates", async () => {
 			const extCode1 = `
-				export default function(pi) {
+					export default function(pi) {
 					pi.on("before_agent_start", async (_event, ctx) => {
 						return {
 							systemPrompt: "first\\n\\n" + ctx.getSystemPrompt(),

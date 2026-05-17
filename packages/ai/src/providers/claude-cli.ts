@@ -917,6 +917,10 @@ function cleanupClaudeArgTempFiles(files: string[]): void {
 	}
 }
 
+function serializeCompactionControl(options?: StreamOptions): string | undefined {
+	return options?.compactionControl ? JSON.stringify(options.compactionControl) : undefined;
+}
+
 type ClaudeInvocation = {
 	args: string[];
 	stdinPayload: string;
@@ -932,6 +936,7 @@ function buildClaudeInvocation(
 	context: Context,
 	prompt: string,
 	stickySession?: StickyClaudeSession,
+	options?: StreamOptions,
 ): ClaudeInvocation {
 	const home = process.env.HOME ?? "/root";
 	const tempFiles: string[] = [];
@@ -969,6 +974,11 @@ function buildClaudeInvocation(
 		"--add-dir",
 		`${home}/projects/ahlnos`,
 	);
+
+	const compactionControl = serializeCompactionControl(options);
+	if (compactionControl) {
+		args.push("--compaction-control", compactionControl);
+	}
 
 	const systemPrompt = context.systemPrompt;
 	if (systemPrompt?.trim()) {
@@ -1629,6 +1639,7 @@ class ClaudeWorker {
 	private tempFiles: string[] = [];
 	private stopped = false;
 	private readonly launchSystemPromptHash: string;
+	private readonly launchCompactionControl: string | undefined;
 	// Each entry counts a turn that was aborted by the caller while still in
 	// flight on claude. We keep the worker alive and discard claude's events
 	// for those turns until their `result` event arrives, which lets the next
@@ -1640,9 +1651,11 @@ class ClaudeWorker {
 		model: Model<"claude-cli">,
 		context: Context,
 		private readonly stickySession: StickyClaudeSession,
+		options?: StreamOptions,
 	) {
 		this.launchSystemPromptHash = stickySession.systemPromptHash;
-		const invocation = buildClaudeInvocation(model, context, "", stickySession);
+		this.launchCompactionControl = serializeCompactionControl(options);
+		const invocation = buildClaudeInvocation(model, context, "", stickySession, options);
 		this.tempFiles = invocation.tempFiles;
 		const childEnv = claudeChildEnv();
 		const home = process.env.HOME ?? "/root";
@@ -1696,6 +1709,10 @@ class ClaudeWorker {
 
 	matchesSystemPromptHash(hash: string): boolean {
 		return this.launchSystemPromptHash === hash;
+	}
+
+	matchesCompactionControl(options?: StreamOptions): boolean {
+		return this.launchCompactionControl === serializeCompactionControl(options);
 	}
 
 	isIdle(): boolean {
@@ -1789,7 +1806,11 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, options?: St
 		const nextSeenMessageCount = latestUserIndex(context) + 2;
 		try {
 			let worker = claudeWorkers.get(stickySession.sessionKey);
-			if (worker?.isIdle() && !worker.matchesSystemPromptHash(stickySession.systemPromptHash)) {
+			if (
+				worker?.isIdle() &&
+				(!worker.matchesSystemPromptHash(stickySession.systemPromptHash) ||
+					!worker.matchesCompactionControl(options))
+			) {
 				appendClaudeSessionTelemetry(stickySession, "worker-restart-context-drift");
 				claudeWorkers.delete(stickySession.sessionKey);
 				return runClaudeCliAfterWorkerStop(
@@ -1803,7 +1824,7 @@ function runClaudeCli(model: Model<"claude-cli">, context: Context, options?: St
 				);
 			}
 			if (!worker) {
-				worker = new ClaudeWorker(model, context, stickySession);
+				worker = new ClaudeWorker(model, context, stickySession, options);
 				claudeWorkers.set(stickySession.sessionKey, worker);
 			}
 			const state: ClaudeRequestState = createWorkerRequestState({
@@ -1839,7 +1860,7 @@ function runClaudeCliAfterWorkerStop(
 	queueMicrotask(async () => {
 		try {
 			await worker.stopAndWait();
-			const replacement = new ClaudeWorker(model, context, stickySession);
+			const replacement = new ClaudeWorker(model, context, stickySession, options);
 			claudeWorkers.set(stickySession.sessionKey, replacement);
 			let state: ClaudeRequestState;
 			state = createWorkerRequestState({
@@ -1880,7 +1901,7 @@ function runClaudeCliOneShot(
 	const maxRuntimeMs = resolveMaxRuntimeMs();
 
 	const home = process.env.HOME ?? "/root";
-	const invocation = buildClaudeInvocation(model, context, prompt, stickySession);
+	const invocation = buildClaudeInvocation(model, context, prompt, stickySession, options);
 	if (stickySession)
 		appendClaudeSessionTelemetry(stickySession, stickySession.turns === 0 ? "start-new" : "resume-one-shot");
 	let child: ReturnType<typeof spawn>;

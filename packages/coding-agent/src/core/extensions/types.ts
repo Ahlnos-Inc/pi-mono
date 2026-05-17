@@ -1010,6 +1010,8 @@ export interface BeforeAgentStartEventResult {
 	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
 	systemPrompt?: string;
+	/** Optional provider compaction policy for this turn. Unsupported providers ignore it. */
+	compactionControl?: SimpleStreamOptions["compactionControl"];
 }
 
 export interface SessionBeforeSwitchResult {

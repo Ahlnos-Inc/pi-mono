@@ -260,6 +260,12 @@ export type StdinBufferOptions = {
 	 * After this time, the buffer is flushed even if incomplete
 	 */
 	timeout?: number;
+	/**
+	 * Maximum idle time to wait for the bracketed paste end marker (default: 2000ms)
+	 * before flushing the buffered paste content. This prevents a dropped paste end
+	 * marker from swallowing all future input indefinitely.
+	 */
+	pasteTimeout?: number;
 };
 
 export type StdinBufferEventMap = {
@@ -275,13 +281,16 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private buffer: string = "";
 	private timeout: ReturnType<typeof setTimeout> | null = null;
 	private readonly timeoutMs: number;
+	private readonly pasteTimeoutMs: number;
 	private pasteMode: boolean = false;
 	private pasteBuffer: string = "";
+	private pasteTimeout: ReturnType<typeof setTimeout> | null = null;
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
 		this.timeoutMs = options.timeout ?? 10;
+		this.pasteTimeoutMs = options.pasteTimeout ?? 2000;
 	}
 
 	public process(data: string | Buffer): void {
@@ -318,18 +327,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
 			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
-
-				this.pasteMode = false;
-				this.pasteBuffer = "";
-				this.pendingKittyPrintableCodepoint = undefined;
-
-				this.emit("paste", pastedContent);
+				const remaining = this.completePaste(endIndex);
 
 				if (remaining.length > 0) {
 					this.process(remaining);
 				}
+			} else {
+				this.schedulePasteTimeout();
 			}
 			return;
 		}
@@ -352,18 +356,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
 			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
-
-				this.pasteMode = false;
-				this.pasteBuffer = "";
-				this.pendingKittyPrintableCodepoint = undefined;
-
-				this.emit("paste", pastedContent);
+				const remaining = this.completePaste(endIndex);
 
 				if (remaining.length > 0) {
 					this.process(remaining);
 				}
+			} else {
+				this.schedulePasteTimeout();
 			}
 			return;
 		}
@@ -397,10 +396,58 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.emit("data", sequence);
 	}
 
+	private completePaste(endIndex: number): string {
+		this.clearPasteTimeout();
+
+		const pastedContent = this.pasteBuffer.slice(0, endIndex);
+		const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
+
+		this.pasteMode = false;
+		this.pasteBuffer = "";
+		this.pendingKittyPrintableCodepoint = undefined;
+
+		this.emit("paste", pastedContent);
+		return remaining;
+	}
+
+	private schedulePasteTimeout(): void {
+		this.clearPasteTimeout();
+		this.pasteTimeout = setTimeout(() => {
+			if (!this.pasteMode) return;
+			const pastedContent = this.pasteBuffer;
+			this.pasteMode = false;
+			this.pasteBuffer = "";
+			this.pendingKittyPrintableCodepoint = undefined;
+			this.pasteTimeout = null;
+			if (pastedContent.length > 0) {
+				this.emit("paste", pastedContent);
+			}
+		}, this.pasteTimeoutMs);
+	}
+
+	private clearPasteTimeout(): void {
+		if (this.pasteTimeout) {
+			clearTimeout(this.pasteTimeout);
+			this.pasteTimeout = null;
+		}
+	}
+
 	flush(): string[] {
 		if (this.timeout) {
 			clearTimeout(this.timeout);
 			this.timeout = null;
+		}
+		this.clearPasteTimeout();
+
+		if (this.pasteMode) {
+			const pastedContent = this.pasteBuffer;
+			this.pasteMode = false;
+			this.pasteBuffer = "";
+			this.pendingKittyPrintableCodepoint = undefined;
+			if (pastedContent.length > 0) {
+				this.emit("paste", pastedContent);
+			}
+			return [];
 		}
 
 		if (this.buffer.length === 0) {
@@ -418,6 +465,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			clearTimeout(this.timeout);
 			this.timeout = null;
 		}
+		this.clearPasteTimeout();
 		this.buffer = "";
 		this.pasteMode = false;
 		this.pasteBuffer = "";

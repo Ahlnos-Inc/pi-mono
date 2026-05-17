@@ -1,5 +1,5 @@
 import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, type Model, type StreamOptions } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "../../src/index.js";
@@ -299,6 +299,31 @@ describe("AgentSession model and extension characterization", () => {
 		expect(
 			harness.session.messages.some((message) => message.role === "custom" && message.customType === "before-start"),
 		).toBe(true);
+	});
+
+	it("forwards before_agent_start compaction control to the provider for one turn", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => ({
+						compactionControl: { minInputTokens: 1000, type: "summarize_sections" },
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const seenOptions: Array<StreamOptions["compactionControl"]> = [];
+		harness.setResponses([
+			(_context, options) => {
+				seenOptions.push(options?.compactionControl);
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await harness.session.prompt("hello");
+
+		expect(seenOptions).toEqual([{ minInputTokens: 1000, type: "summarize_sections" }]);
+		expect(harness.session.agent.compactionControl).toBeUndefined();
 	});
 
 	it("bindExtensions emits session_start and reload emits session_shutdown then session_start", async () => {

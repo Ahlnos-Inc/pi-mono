@@ -1096,17 +1096,24 @@ export class AgentSession {
 				// Ensure we're using the base prompt (in case previous turn had modifications)
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
+			this.agent.compactionControl = result?.compactionControl;
 		} catch (error) {
+			this.agent.compactionControl = undefined;
 			preflightResult?.(false);
 			throw error;
 		}
 
 		if (!messages) {
+			this.agent.compactionControl = undefined;
 			return;
 		}
 
 		preflightResult?.(true);
-		await this.agent.prompt(messages);
+		try {
+			await this.agent.prompt(messages);
+		} finally {
+			this.agent.compactionControl = undefined;
+		}
 		await this.waitForRetry();
 	}
 

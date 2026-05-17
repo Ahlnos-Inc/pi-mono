@@ -203,6 +203,16 @@ describe("claude-cli provider", () => {
 		expect(spawnMock.mock.calls[0][1]).toEqual(expect.arrayContaining(["--system-prompt", " route instructions\n"]));
 	});
 
+	it("passes compaction control to claude-cli when requested", () => {
+		const compactionControl = { minInputTokens: 1000, type: "summarize_sections" as const };
+
+		streamClaudeCli(model, context("route instructions"), { compactionControl });
+
+		expect(spawnMock.mock.calls[0][1]).toEqual(
+			expect.arrayContaining(["--compaction-control", JSON.stringify(compactionControl)]),
+		);
+	});
+
 	it("skips --system-prompt for whitespace-only system prompts", () => {
 		streamClaudeCli(model, context(" \n\t "), {});
 

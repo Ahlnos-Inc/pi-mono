@@ -260,7 +260,7 @@ function emptyCustomModelsResult(error?: string): CustomModelsResult {
 
 function localModelsJsonPath(modelsJsonPath: string): string {
 	return modelsJsonPath.endsWith(".json")
-		? modelsJsonPath.slice(0, -".json".length) + ".local.json"
+		? `${modelsJsonPath.slice(0, -".json".length)}.local.json`
 		: `${modelsJsonPath}.local`;
 }
 
