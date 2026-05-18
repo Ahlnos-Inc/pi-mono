@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.75.1] - 2026-05-18
+
+## [0.75.0] - 2026-05-17
+
+### Breaking Changes
+
+- Raised the minimum supported Node.js version to 22.19.0.
+
 ## [0.74.1] - 2026-05-16
 
 ### Added
