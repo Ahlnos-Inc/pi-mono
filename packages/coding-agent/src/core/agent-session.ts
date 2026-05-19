@@ -44,6 +44,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateProviderContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -3072,17 +3073,18 @@ export class AgentSession {
 			}
 
 			if (!hasPostCompactionUsage) {
-				return { tokens: null, contextWindow, percent: null };
+				return { tokens: null, contextWindow, percent: null, source: "provider-visible" };
 			}
 		}
 
-		const estimate = estimateContextTokens(this.messages);
+		const estimate = estimateProviderContextTokens(this.messages);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
 		return {
 			tokens: estimate.tokens,
 			contextWindow,
 			percent,
+			source: "provider-visible",
 		};
 	}
 

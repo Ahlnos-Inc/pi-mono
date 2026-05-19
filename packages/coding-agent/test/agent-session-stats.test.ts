@@ -147,7 +147,7 @@ describe("AgentSession.getSessionStats", () => {
 		}
 	});
 
-	it("reports active context usage without counting prompt cache telemetry", () => {
+	it("reports provider-visible active context usage including prompt cache telemetry", () => {
 		const { session, sessionManager } = createSession();
 
 		try {
@@ -157,8 +157,9 @@ describe("AgentSession.getSessionStats", () => {
 
 			const stats = session.getSessionStats();
 			expect(stats.contextUsage).toBeDefined();
-			expect(stats.contextUsage?.tokens).toBe(473);
-			expect(stats.contextUsage?.percent).toBe((473 / model.contextWindow) * 100);
+			expect(stats.contextUsage?.tokens).toBe(184_389);
+			expect(stats.contextUsage?.percent).toBe((184_389 / model.contextWindow) * 100);
+			expect(stats.contextUsage?.source).toBe("provider-visible");
 		} finally {
 			session.dispose();
 		}

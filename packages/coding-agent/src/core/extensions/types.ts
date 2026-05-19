@@ -279,11 +279,17 @@ export interface ExtensionUIContext {
 // ============================================================================
 
 export interface ContextUsage {
-	/** Estimated context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
+	/** Estimated or provider-visible context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
 	tokens: number | null;
 	contextWindow: number;
 	/** Context usage as percentage of context window, or null if tokens is unknown. */
 	percent: number | null;
+	/**
+	 * Source of the context estimate.
+	 * - local-estimate: derived from session messages and last assistant usage.input/output
+	 * - provider-visible: includes provider cache read/write tokens from the latest assistant usage
+	 */
+	source?: "local-estimate" | "provider-visible";
 }
 
 export interface CompactOptions {
