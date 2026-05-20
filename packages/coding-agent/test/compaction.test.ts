@@ -15,7 +15,7 @@ import {
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
-} from "../src/core/compaction/index.js";
+} from "../src/core/compaction/index.ts";
 import {
 	buildSessionContext,
 	type CompactionEntry,
@@ -25,7 +25,7 @@ import {
 	type SessionEntry,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
-} from "../src/core/session-manager.js";
+} from "../src/core/session-manager.ts";
 
 // ============================================================================
 // Test fixtures

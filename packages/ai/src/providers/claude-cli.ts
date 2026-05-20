@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { registerSessionResourceCleanup } from "../session-resources.js";
+import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
 	AssistantMessage,
 	Context,
@@ -15,8 +15,8 @@ import type {
 	TextContent,
 	Usage,
 	UserQuestionRequest,
-} from "../types.js";
-import { createAssistantMessageEventStream } from "../utils/event-stream.js";
+} from "../types.ts";
+import { createAssistantMessageEventStream } from "../utils/event-stream.ts";
 
 /**
  * claude-cli provider — wraps the local `claude` binary running in print mode (`claude -p`).
@@ -1640,6 +1640,7 @@ class ClaudeWorker {
 	private stopped = false;
 	private readonly launchSystemPromptHash: string;
 	private readonly launchCompactionControl: string | undefined;
+	private readonly stickySession: StickyClaudeSession;
 	// Each entry counts a turn that was aborted by the caller while still in
 	// flight on claude. We keep the worker alive and discard claude's events
 	// for those turns until their `result` event arrives, which lets the next
@@ -1650,9 +1651,10 @@ class ClaudeWorker {
 	constructor(
 		model: Model<"claude-cli">,
 		context: Context,
-		private readonly stickySession: StickyClaudeSession,
+		stickySession: StickyClaudeSession,
 		options?: StreamOptions,
 	) {
+		this.stickySession = stickySession;
 		this.launchSystemPromptHash = stickySession.systemPromptHash;
 		this.launchCompactionControl = serializeCompactionControl(options);
 		const invocation = buildClaudeInvocation(model, context, "", stickySession, options);

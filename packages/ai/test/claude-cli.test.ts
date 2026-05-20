@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { _clearClaudeCliStickySessionsForTest, streamClaudeCli } from "../src/providers/claude-cli.js";
-import type { AssistantMessageEvent, Context, Message, Model } from "../src/types.js";
+import { _clearClaudeCliStickySessionsForTest, streamClaudeCli } from "../src/providers/claude-cli.ts";
+import type { AssistantMessageEvent, Context, Message, Model } from "../src/types.ts";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 

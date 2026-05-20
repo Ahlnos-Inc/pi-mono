@@ -1,7 +1,7 @@
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { AgentSession } from "../../../core/agent-session.js";
-import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
-import { theme } from "../theme/theme.js";
+import type { AgentSession } from "../../../core/agent-session.ts";
+import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
+import { theme } from "../theme/theme.ts";
 
 /**
  * Sanitize text for display in a single-line status.
@@ -16,7 +16,7 @@ function sanitizeStatusText(text: string): string {
 }
 
 /**
- * Format token counts (similar to web-ui)
+ * Format token counts for compact footer display.
  */
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -59,11 +59,13 @@ function getCurrentAgencyAgent(session: AgentSession): string | null {
  */
 export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
+	private session: AgentSession;
+	private footerData: ReadonlyFooterDataProvider;
 
-	constructor(
-		private session: AgentSession,
-		private footerData: ReadonlyFooterDataProvider,
-	) {}
+	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
+		this.session = session;
+		this.footerData = footerData;
+	}
 
 	setSession(session: AgentSession): void {
 		this.session = session;

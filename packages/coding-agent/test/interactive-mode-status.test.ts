@@ -3,10 +3,10 @@ import * as path from "node:path";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { type AutocompleteProvider, CombinedAutocompleteProvider, Container } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
-import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
-import type { SourceInfo } from "../src/core/source-info.js";
-import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
+import type { SourceInfo } from "../src/core/source-info.ts";
+import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
