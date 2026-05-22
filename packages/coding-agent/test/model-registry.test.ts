@@ -239,6 +239,32 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("https://openrouter.ai/api/v1");
 		});
 
+		test("built-in model overrides inherit modality and reasoning metadata when omitted", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					models: [
+						{
+							id: "gpt-5.5",
+							contextWindow: 123456,
+							maxTokens: 9999,
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+
+			const model = registry.find("openai-codex", "gpt-5.5");
+			expect(model).toBeDefined();
+			expect(model?.api).toBe("openai-codex-responses");
+			expect(model?.baseUrl).toBe("https://chatgpt.com/backend-api");
+			expect(model?.reasoning).toBe(true);
+			expect(model?.input).toEqual(["text", "image"]);
+			expect(model?.contextWindow).toBe(123456);
+			expect(model?.maxTokens).toBe(9999);
+		});
+
 		test("non-built-in provider custom models still require baseUrl and apiKey", () => {
 			writeRawModelsJson({
 				"my-custom-provider": {

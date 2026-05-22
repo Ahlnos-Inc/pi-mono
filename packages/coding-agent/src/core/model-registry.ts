@@ -621,6 +621,7 @@ export class ModelRegistry {
 
 		// Cache built-in defaults (api, baseUrl) per provider, extracted from first model.
 		const builtInDefaultsCache = new Map<string, { api: string; baseUrl: string }>();
+		const builtInModelsCache = new Map<string, Model<Api>[]>();
 		const getBuiltInDefaults = (providerName: string): { api: string; baseUrl: string } | undefined => {
 			if (!builtInProviders.has(providerName)) return undefined;
 			if (builtInDefaultsCache.has(providerName)) return builtInDefaultsCache.get(providerName);
@@ -630,6 +631,15 @@ export class ModelRegistry {
 			builtInDefaultsCache.set(providerName, defaults);
 			return defaults;
 		};
+		const getBuiltInModelsForProvider = (providerName: string): Model<Api>[] => {
+			if (!builtInProviders.has(providerName)) return [];
+			if (builtInModelsCache.has(providerName)) return builtInModelsCache.get(providerName) ?? [];
+			const builtIn = getModels(providerName as KnownProvider) as Model<Api>[];
+			builtInModelsCache.set(providerName, builtIn);
+			return builtIn;
+		};
+		const getBuiltInModel = (providerName: string, modelId: string): Model<Api> | undefined =>
+			getBuiltInModelsForProvider(providerName).find((model) => model.id === modelId);
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers)) {
 			const modelDefs = providerConfig.models ?? [];
@@ -638,28 +648,30 @@ export class ModelRegistry {
 			const builtInDefaults = getBuiltInDefaults(providerName);
 
 			for (const modelDef of modelDefs) {
-				const api = modelDef.api ?? providerConfig.api ?? builtInDefaults?.api;
+				const builtInModel = getBuiltInModel(providerName, modelDef.id);
+				const api = modelDef.api ?? providerConfig.api ?? builtInModel?.api ?? builtInDefaults?.api;
 				if (!api) continue;
 
-				const baseUrl = modelDef.baseUrl ?? providerConfig.baseUrl ?? builtInDefaults?.baseUrl;
+				const baseUrl =
+					modelDef.baseUrl ?? providerConfig.baseUrl ?? builtInModel?.baseUrl ?? builtInDefaults?.baseUrl;
 				if (!baseUrl) continue;
 
-				const compat = mergeCompat(providerConfig.compat, modelDef.compat);
+				const compat = mergeCompat(mergeCompat(builtInModel?.compat, providerConfig.compat), modelDef.compat);
 				this.storeModelHeaders(providerName, modelDef.id, modelDef.headers);
 
 				const defaultCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 				models.push({
 					id: modelDef.id,
-					name: modelDef.name ?? modelDef.id,
+					name: modelDef.name ?? builtInModel?.name ?? modelDef.id,
 					api: api as Api,
 					provider: providerName,
 					baseUrl,
-					reasoning: modelDef.reasoning ?? false,
-					thinkingLevelMap: modelDef.thinkingLevelMap,
-					input: (modelDef.input ?? ["text"]) as ("text" | "image")[],
-					cost: modelDef.cost ?? defaultCost,
-					contextWindow: modelDef.contextWindow ?? 128000,
-					maxTokens: modelDef.maxTokens ?? 16384,
+					reasoning: modelDef.reasoning ?? builtInModel?.reasoning ?? false,
+					thinkingLevelMap: modelDef.thinkingLevelMap ?? builtInModel?.thinkingLevelMap,
+					input: (modelDef.input ?? builtInModel?.input ?? ["text"]) as ("text" | "image")[],
+					cost: modelDef.cost ?? builtInModel?.cost ?? defaultCost,
+					contextWindow: modelDef.contextWindow ?? builtInModel?.contextWindow ?? 128000,
+					maxTokens: modelDef.maxTokens ?? builtInModel?.maxTokens ?? 16384,
 					headers: undefined,
 					compat,
 				} as Model<Api>);
