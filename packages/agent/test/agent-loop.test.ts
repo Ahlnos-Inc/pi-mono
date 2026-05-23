@@ -1246,6 +1246,28 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(() => agentLoopContinue(context, config)).toThrow("Cannot continue: no messages in context");
 	});
 
+	it("should no-op instead of crashing when continuation is requested after an assistant turn", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [createUserMessage("Hello"), createAssistantMessage([{ type: "text", text: "Done." }])],
+			tools: [],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoopContinue(context, config);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		expect(await stream.result()).toEqual([]);
+		expect(events.map((event) => event.type)).toEqual(["agent_start", "agent_end"]);
+	});
+
 	it("should continue from existing context without emitting user message events", async () => {
 		const userMessage: AgentMessage = createUserMessage("Hello");
 

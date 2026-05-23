@@ -72,7 +72,12 @@ export function agentLoopContinue(
 	}
 
 	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot continue from message role: assistant");
+		const stream = createAgentStream();
+		queueMicrotask(() => {
+			stream.push({ type: "agent_start" });
+			stream.push({ type: "agent_end", messages: [] });
+		});
+		return stream;
 	}
 
 	const stream = createAgentStream();
@@ -129,7 +134,9 @@ export async function runAgentLoopContinue(
 	}
 
 	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot continue from message role: assistant");
+		await emit({ type: "agent_start" });
+		await emit({ type: "agent_end", messages: [] });
+		return [];
 	}
 
 	const newMessages: AgentMessage[] = [];
